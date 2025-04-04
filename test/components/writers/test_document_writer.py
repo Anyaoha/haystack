@@ -1,9 +1,12 @@
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
 import pytest
 
 from haystack import Document, DeserializationError
 from haystack.testing.factory import document_store_class
 from haystack.components.writers.document_writer import DocumentWriter
-from haystack.document_stores import DuplicatePolicy
+from haystack.document_stores.types import DuplicatePolicy
 from haystack.document_stores.in_memory import InMemoryDocumentStore
 
 
@@ -16,7 +19,7 @@ class TestDocumentWriter:
             "type": "haystack.components.writers.document_writer.DocumentWriter",
             "init_parameters": {
                 "document_store": {"type": "haystack.testing.factory.MockedDocumentStore", "init_parameters": {}},
-                "policy": "FAIL",
+                "policy": "NONE",
             },
         }
 
@@ -54,7 +57,7 @@ class TestDocumentWriter:
 
     def test_from_dict_without_docstore_type(self):
         data = {"type": "DocumentWriter", "init_parameters": {"document_store": {"init_parameters": {}}}}
-        with pytest.raises(DeserializationError, match="Missing 'type' in document store's serialization data"):
+        with pytest.raises(DeserializationError):
             DocumentWriter.from_dict(data)
 
     def test_from_dict_nonexisting_docstore(self):
@@ -88,4 +91,44 @@ class TestDocumentWriter:
         assert result["documents_written"] == 2
 
         result = writer.run(documents=documents)
+        assert result["documents_written"] == 0
+
+    @pytest.mark.asyncio
+    async def test_run_async_invalid_docstore(self):
+        document_store = document_store_class("MockedDocumentStore")
+
+        writer = DocumentWriter(document_store)
+        documents = [
+            Document(content="This is the text of a document."),
+            Document(content="This is the text of another document."),
+        ]
+
+        with pytest.raises(TypeError, match="does not provide async support"):
+            await writer.run_async(documents=documents)
+
+    @pytest.mark.asyncio
+    async def test_run_async(self):
+        document_store = InMemoryDocumentStore()
+        writer = DocumentWriter(document_store)
+        documents = [
+            Document(content="This is the text of a document."),
+            Document(content="This is the text of another document."),
+        ]
+
+        result = await writer.run_async(documents=documents)
+        assert result["documents_written"] == 2
+
+    @pytest.mark.asyncio
+    async def test_run_async_skip_policy(self):
+        document_store = InMemoryDocumentStore()
+        writer = DocumentWriter(document_store, policy=DuplicatePolicy.SKIP)
+        documents = [
+            Document(content="This is the text of a document."),
+            Document(content="This is the text of another document."),
+        ]
+
+        result = await writer.run_async(documents=documents)
+        assert result["documents_written"] == 2
+
+        result = await writer.run_async(documents=documents)
         assert result["documents_written"] == 0

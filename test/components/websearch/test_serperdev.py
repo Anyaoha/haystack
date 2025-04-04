@@ -1,5 +1,11 @@
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import json
 import os
 from unittest.mock import Mock, patch
+from haystack.utils.auth import Secret
 
 import pytest
 from requests import Timeout, RequestException, HTTPError
@@ -107,25 +113,38 @@ def mock_serper_dev_search_result():
         yield mock_run
 
 
+@pytest.fixture
+def mock_serper_dev_search_result_no_snippet():
+    resp = {**EXAMPLE_SERPERDEV_RESPONSE}
+    del resp["organic"][0]["snippet"]
+    with patch("haystack.components.websearch.serper_dev.requests") as mock_run:
+        mock_run.post.return_value = Mock(status_code=200, json=lambda: resp)
+        yield mock_run
+
+
 class TestSerperDevSearchAPI:
     def test_init_fail_wo_api_key(self, monkeypatch):
         monkeypatch.delenv("SERPERDEV_API_KEY", raising=False)
-        with pytest.raises(ValueError, match="SerperDevWebSearch expects an API key"):
+        with pytest.raises(ValueError, match="None of the .* environment variables are set"):
             SerperDevWebSearch()
 
-    def test_to_dict(self):
-        component = SerperDevWebSearch(
-            api_key="test_key", top_k=10, allowed_domains=["test.com"], search_params={"param": "test"}
-        )
+    def test_to_dict(self, monkeypatch):
+        monkeypatch.setenv("SERPERDEV_API_KEY", "test-api-key")
+        component = SerperDevWebSearch(top_k=10, allowed_domains=["test.com"], search_params={"param": "test"})
         data = component.to_dict()
         assert data == {
             "type": "haystack.components.websearch.serper_dev.SerperDevWebSearch",
-            "init_parameters": {"top_k": 10, "allowed_domains": ["test.com"], "search_params": {"param": "test"}},
+            "init_parameters": {
+                "api_key": {"env_vars": ["SERPERDEV_API_KEY"], "strict": True, "type": "env_var"},
+                "top_k": 10,
+                "allowed_domains": ["test.com"],
+                "search_params": {"param": "test"},
+            },
         }
 
     @pytest.mark.parametrize("top_k", [1, 5, 7])
     def test_web_search_top_k(self, mock_serper_dev_search_result, top_k: int):
-        ws = SerperDevWebSearch(api_key="some_invalid_key", top_k=top_k)
+        ws = SerperDevWebSearch(api_key=Secret.from_token("test-api-key"), top_k=top_k)
         results = ws.run(query="Who is the boyfriend of Olivia Wilde?")
         documents = results["documents"]
         links = results["links"]
@@ -134,10 +153,14 @@ class TestSerperDevSearchAPI:
         assert all(isinstance(link, str) for link in links)
         assert all(link.startswith("http") for link in links)
 
+    def test_no_snippet(self, mock_serper_dev_search_result_no_snippet):
+        ws = SerperDevWebSearch(api_key=Secret.from_token("test-api-key"), top_k=1)
+        ws.run(query="Who is the boyfriend of Olivia Wilde?")
+
     @patch("requests.post")
     def test_timeout_error(self, mock_post):
         mock_post.side_effect = Timeout
-        ws = SerperDevWebSearch(api_key="some_invalid_key")
+        ws = SerperDevWebSearch(api_key=Secret.from_token("test-api-key"))
 
         with pytest.raises(TimeoutError):
             ws.run(query="Who is the boyfriend of Olivia Wilde?")
@@ -145,7 +168,7 @@ class TestSerperDevSearchAPI:
     @patch("requests.post")
     def test_request_exception(self, mock_post):
         mock_post.side_effect = RequestException
-        ws = SerperDevWebSearch(api_key="some_invalid_key")
+        ws = SerperDevWebSearch(api_key=Secret.from_token("test-api-key"))
 
         with pytest.raises(SerperDevError):
             ws.run(query="Who is the boyfriend of Olivia Wilde?")
@@ -155,7 +178,7 @@ class TestSerperDevSearchAPI:
         mock_response = mock_post.return_value
         mock_response.status_code = 404
         mock_response.raise_for_status.side_effect = HTTPError
-        ws = SerperDevWebSearch(api_key="some_invalid_key")
+        ws = SerperDevWebSearch(api_key=Secret.from_token("test-api-key"))
 
         with pytest.raises(SerperDevError):
             ws.run(query="Who is the boyfriend of Olivia Wilde?")
@@ -166,10 +189,10 @@ class TestSerperDevSearchAPI:
     )
     @pytest.mark.integration
     def test_web_search(self):
-        ws = SerperDevWebSearch(api_key=os.environ.get("SERPERDEV_API_KEY", None), top_k=10)
+        ws = SerperDevWebSearch(top_k=10)
         results = ws.run(query="Who is the boyfriend of Olivia Wilde?")
         documents = results["documents"]
-        links = results["documents"]
+        links = results["links"]
         assert len(documents) == len(links) == 10
         assert all(isinstance(doc, Document) for doc in results)
         assert all(isinstance(link, str) for link in links)

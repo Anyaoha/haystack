@@ -1,144 +1,92 @@
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+from datetime import datetime
+import logging
 import os
 from typing import List
-from unittest.mock import patch, Mock
 
-import openai
 import pytest
+from openai import OpenAIError
 
-from haystack.components.generators import GPTGenerator
-from haystack.components.generators.utils import default_streaming_callback
-from haystack.dataclasses import StreamingChunk, ChatMessage
-
-
-@pytest.fixture
-def mock_chat_completion():
-    """
-    Mock the OpenAI API completion response and reuse it for tests
-    """
-    with patch("openai.ChatCompletion.create", autospec=True) as mock_chat_completion_create:
-        # mimic the response from the OpenAI API
-        mock_choice = Mock()
-        mock_choice.index = 0
-        mock_choice.finish_reason = "stop"
-
-        mock_message = Mock()
-        mock_message.content = "I'm fine, thanks. How are you?"
-        mock_message.role = "user"
-
-        mock_choice.message = mock_message
-
-        mock_response = Mock()
-        mock_response.model = "gpt-3.5-turbo"
-        mock_response.usage = Mock()
-        mock_response.usage.items.return_value = [
-            ("prompt_tokens", 57),
-            ("completion_tokens", 40),
-            ("total_tokens", 97),
-        ]
-        mock_response.choices = [mock_choice]
-        mock_chat_completion_create.return_value = mock_response
-        yield mock_chat_completion_create
+from haystack.components.generators import OpenAIGenerator
+from haystack.components.generators.utils import print_streaming_chunk
+from haystack.dataclasses import ChatMessage, StreamingChunk
+from haystack.utils.auth import Secret
 
 
-def streaming_chunk(content: str):
-    """
-    Mock chunks of streaming responses from the OpenAI API
-    """
-    # mimic the chunk response from the OpenAI API
-    mock_choice = Mock()
-    mock_choice.index = 0
-    mock_choice.delta.content = content
-    mock_choice.finish_reason = "stop"
-
-    mock_response = Mock()
-    mock_response.choices = [mock_choice]
-    mock_response.model = "gpt-3.5-turbo"
-    mock_response.usage = Mock()
-    mock_response.usage.items.return_value = [("prompt_tokens", 57), ("completion_tokens", 40), ("total_tokens", 97)]
-    return mock_response
-
-
-class TestGPTGenerator:
-    def test_init_default(self):
-        component = GPTGenerator(api_key="test-api-key")
-        assert openai.api_key == "test-api-key"
-        assert component.model_name == "gpt-3.5-turbo"
+class TestOpenAIGenerator:
+    def test_init_default(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-api-key")
+        component = OpenAIGenerator()
+        assert component.client.api_key == "test-api-key"
+        assert component.model == "gpt-4o-mini"
         assert component.streaming_callback is None
-        assert component.api_base_url == "https://api.openai.com/v1"
-        assert openai.api_base == "https://api.openai.com/v1"
         assert not component.generation_kwargs
+        assert component.client.timeout == 30
+        assert component.client.max_retries == 5
 
     def test_init_fail_wo_api_key(self, monkeypatch):
-        openai.api_key = None
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        with pytest.raises(ValueError, match="GPTGenerator expects an OpenAI API key"):
-            GPTGenerator()
+        with pytest.raises(ValueError, match="None of the .* environment variables are set"):
+            OpenAIGenerator()
 
-    def test_init_with_parameters(self):
-        component = GPTGenerator(
-            api_key="test-api-key",
-            model_name="gpt-4",
-            streaming_callback=default_streaming_callback,
+    def test_init_with_parameters(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_TIMEOUT", "100")
+        monkeypatch.setenv("OPENAI_MAX_RETRIES", "10")
+        component = OpenAIGenerator(
+            api_key=Secret.from_token("test-api-key"),
+            model="gpt-4o-mini",
+            streaming_callback=print_streaming_chunk,
             api_base_url="test-base-url",
             generation_kwargs={"max_tokens": 10, "some_test_param": "test-params"},
+            timeout=40.0,
+            max_retries=1,
         )
-        assert openai.api_key == "test-api-key"
-        assert component.model_name == "gpt-4"
-        assert component.streaming_callback is default_streaming_callback
-        assert component.api_base_url == "test-base-url"
-        assert openai.api_base == "test-base-url"
+        assert component.client.api_key == "test-api-key"
+        assert component.model == "gpt-4o-mini"
+        assert component.streaming_callback is print_streaming_chunk
         assert component.generation_kwargs == {"max_tokens": 10, "some_test_param": "test-params"}
+        assert component.client.timeout == 40.0
+        assert component.client.max_retries == 1
 
-    def test_to_dict_default(self):
-        component = GPTGenerator(api_key="test-api-key")
+    def test_to_dict_default(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-api-key")
+        component = OpenAIGenerator()
         data = component.to_dict()
         assert data == {
-            "type": "haystack.components.generators.openai.GPTGenerator",
+            "type": "haystack.components.generators.openai.OpenAIGenerator",
             "init_parameters": {
-                "model_name": "gpt-3.5-turbo",
+                "api_key": {"env_vars": ["OPENAI_API_KEY"], "strict": True, "type": "env_var"},
+                "model": "gpt-4o-mini",
                 "streaming_callback": None,
                 "system_prompt": None,
-                "api_base_url": "https://api.openai.com/v1",
+                "api_base_url": None,
+                "organization": None,
                 "generation_kwargs": {},
             },
         }
 
-    def test_to_dict_with_parameters(self):
-        component = GPTGenerator(
-            api_key="test-api-key",
-            model_name="gpt-4",
-            streaming_callback=default_streaming_callback,
+    def test_to_dict_with_parameters(self, monkeypatch):
+        monkeypatch.setenv("ENV_VAR", "test-api-key")
+        component = OpenAIGenerator(
+            api_key=Secret.from_env_var("ENV_VAR"),
+            model="gpt-4o-mini",
+            streaming_callback=print_streaming_chunk,
             api_base_url="test-base-url",
+            organization="org-1234567",
             generation_kwargs={"max_tokens": 10, "some_test_param": "test-params"},
         )
         data = component.to_dict()
         assert data == {
-            "type": "haystack.components.generators.openai.GPTGenerator",
+            "type": "haystack.components.generators.openai.OpenAIGenerator",
             "init_parameters": {
-                "model_name": "gpt-4",
+                "api_key": {"env_vars": ["ENV_VAR"], "strict": True, "type": "env_var"},
+                "model": "gpt-4o-mini",
                 "system_prompt": None,
                 "api_base_url": "test-base-url",
-                "streaming_callback": "haystack.components.generators.utils.default_streaming_callback",
-                "generation_kwargs": {"max_tokens": 10, "some_test_param": "test-params"},
-            },
-        }
-
-    def test_to_dict_with_lambda_streaming_callback(self):
-        component = GPTGenerator(
-            api_key="test-api-key",
-            model_name="gpt-4",
-            streaming_callback=lambda x: x,
-            api_base_url="test-base-url",
-            generation_kwargs={"max_tokens": 10, "some_test_param": "test-params"},
-        )
-        data = component.to_dict()
-        assert data == {
-            "type": "haystack.components.generators.openai.GPTGenerator",
-            "init_parameters": {
-                "model_name": "gpt-4",
-                "system_prompt": None,
-                "api_base_url": "test-base-url",
-                "streaming_callback": "test_openai.<lambda>",
+                "organization": "org-1234567",
+                "streaming_callback": "haystack.components.generators.utils.print_streaming_chunk",
                 "generation_kwargs": {"max_tokens": 10, "some_test_param": "test-params"},
             },
         }
@@ -146,38 +94,41 @@ class TestGPTGenerator:
     def test_from_dict(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "fake-api-key")
         data = {
-            "type": "haystack.components.generators.openai.GPTGenerator",
+            "type": "haystack.components.generators.openai.OpenAIGenerator",
             "init_parameters": {
-                "model_name": "gpt-4",
+                "api_key": {"env_vars": ["OPENAI_API_KEY"], "strict": True, "type": "env_var"},
+                "model": "gpt-4o-mini",
                 "system_prompt": None,
+                "organization": None,
                 "api_base_url": "test-base-url",
-                "streaming_callback": "haystack.components.generators.utils.default_streaming_callback",
+                "streaming_callback": "haystack.components.generators.utils.print_streaming_chunk",
                 "generation_kwargs": {"max_tokens": 10, "some_test_param": "test-params"},
             },
         }
-        component = GPTGenerator.from_dict(data)
-        assert component.model_name == "gpt-4"
-        assert component.streaming_callback is default_streaming_callback
+        component = OpenAIGenerator.from_dict(data)
+        assert component.model == "gpt-4o-mini"
+        assert component.streaming_callback is print_streaming_chunk
         assert component.api_base_url == "test-base-url"
         assert component.generation_kwargs == {"max_tokens": 10, "some_test_param": "test-params"}
+        assert component.api_key == Secret.from_env_var("OPENAI_API_KEY")
 
     def test_from_dict_fail_wo_env_var(self, monkeypatch):
-        openai.api_key = None
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         data = {
-            "type": "haystack.components.generators.openai.GPTGenerator",
+            "type": "haystack.components.generators.openai.OpenAIGenerator",
             "init_parameters": {
-                "model_name": "gpt-4",
+                "api_key": {"env_vars": ["OPENAI_API_KEY"], "strict": True, "type": "env_var"},
+                "model": "gpt-4o-mini",
                 "api_base_url": "test-base-url",
-                "streaming_callback": "haystack.components.generators.utils.default_streaming_callback",
+                "streaming_callback": "haystack.components.generators.utils.print_streaming_chunk",
                 "generation_kwargs": {"max_tokens": 10, "some_test_param": "test-params"},
             },
         }
-        with pytest.raises(ValueError, match="GPTGenerator expects an OpenAI API key"):
-            GPTGenerator.from_dict(data)
+        with pytest.raises(ValueError, match="None of the .* environment variables are set"):
+            OpenAIGenerator.from_dict(data)
 
-    def test_run(self, mock_chat_completion):
-        component = GPTGenerator(api_key="test-api-key")
+    def test_run(self, openai_mock_chat_completion):
+        component = OpenAIGenerator(api_key=Secret.from_token("test-api-key"))
         response = component.run("What's Natural Language Processing?")
 
         # check that the component returns the correct ChatMessage response
@@ -187,12 +138,55 @@ class TestGPTGenerator:
         assert len(response["replies"]) == 1
         assert [isinstance(reply, str) for reply in response["replies"]]
 
-    def test_run_with_params(self, mock_chat_completion):
-        component = GPTGenerator(api_key="test-api-key", generation_kwargs={"max_tokens": 10, "temperature": 0.5})
+    def test_run_with_params_streaming(self, openai_mock_chat_completion_chunk):
+        streaming_callback_called = False
+
+        def streaming_callback(chunk: StreamingChunk) -> None:
+            nonlocal streaming_callback_called
+            streaming_callback_called = True
+
+        component = OpenAIGenerator(api_key=Secret.from_token("test-api-key"), streaming_callback=streaming_callback)
+        response = component.run("Come on, stream!")
+
+        # check we called the streaming callback
+        assert streaming_callback_called
+
+        # check that the component still returns the correct response
+        assert isinstance(response, dict)
+        assert "replies" in response
+        assert isinstance(response["replies"], list)
+        assert len(response["replies"]) == 1
+        assert "Hello" in response["replies"][0]  # see openai_mock_chat_completion_chunk
+
+    def test_run_with_streaming_callback_in_run_method(self, openai_mock_chat_completion_chunk):
+        streaming_callback_called = False
+
+        def streaming_callback(chunk: StreamingChunk) -> None:
+            nonlocal streaming_callback_called
+            streaming_callback_called = True
+
+        # pass streaming_callback to run()
+        component = OpenAIGenerator(api_key=Secret.from_token("test-api-key"))
+        response = component.run("Come on, stream!", streaming_callback=streaming_callback)
+
+        # check we called the streaming callback
+        assert streaming_callback_called
+
+        # check that the component still returns the correct response
+        assert isinstance(response, dict)
+        assert "replies" in response
+        assert isinstance(response["replies"], list)
+        assert len(response["replies"]) == 1
+        assert "Hello" in response["replies"][0]  # see openai_mock_chat_completion_chunk
+
+    def test_run_with_params(self, openai_mock_chat_completion):
+        component = OpenAIGenerator(
+            api_key=Secret.from_token("test-api-key"), generation_kwargs={"max_tokens": 10, "temperature": 0.5}
+        )
         response = component.run("What's Natural Language Processing?")
 
         # check that the component calls the OpenAI API with the correct parameters
-        _, kwargs = mock_chat_completion.call_args
+        _, kwargs = openai_mock_chat_completion.call_args
         assert kwargs["max_tokens"] == 10
         assert kwargs["temperature"] == 0.5
 
@@ -203,46 +197,16 @@ class TestGPTGenerator:
         assert len(response["replies"]) == 1
         assert [isinstance(reply, str) for reply in response["replies"]]
 
-    def test_run_streaming(self, mock_chat_completion):
-        streaming_call_count = 0
-
-        # Define the streaming callback function and assert that it is called with StreamingChunk objects
-        def streaming_callback_fn(chunk: StreamingChunk):
-            nonlocal streaming_call_count
-            streaming_call_count += 1
-            assert isinstance(chunk, StreamingChunk)
-
-        generator = GPTGenerator(api_key="test-api-key", streaming_callback=streaming_callback_fn)
-
-        # Create a fake streamed response
-        # self needed here, don't remove
-        def mock_iter(self):
-            yield streaming_chunk("Hello")
-            yield streaming_chunk("How are you?")
-
-        mock_response = Mock(**{"__iter__": mock_iter})
-        mock_chat_completion.return_value = mock_response
-
-        response = generator.run("Hello there")
-
-        # Assert that the streaming callback was called twice
-        assert streaming_call_count == 2
-
-        # Assert that the response contains the generated replies
-        assert "replies" in response
-        assert isinstance(response["replies"], list)
-        assert len(response["replies"]) > 0
-        assert [isinstance(reply, str) for reply in response["replies"]]
-
     def test_check_abnormal_completions(self, caplog):
-        component = GPTGenerator(api_key="test-api-key")
+        caplog.set_level(logging.INFO)
+        component = OpenAIGenerator(api_key=Secret.from_token("test-api-key"))
 
         # underlying implementation uses ChatMessage objects so we have to use them here
         messages: List[ChatMessage] = []
         for i, _ in enumerate(range(4)):
             message = ChatMessage.from_assistant("Hello")
             metadata = {"finish_reason": "content_filter" if i % 2 == 0 else "length", "index": i}
-            message.metadata.update(metadata)
+            message.meta.update(metadata)
             messages.append(message)
 
         for m in messages:
@@ -268,15 +232,15 @@ class TestGPTGenerator:
     )
     @pytest.mark.integration
     def test_live_run(self):
-        component = GPTGenerator(api_key=os.environ.get("OPENAI_API_KEY"))
+        component = OpenAIGenerator()
         results = component.run("What's the capital of France?")
         assert len(results["replies"]) == 1
-        assert len(results["metadata"]) == 1
+        assert len(results["meta"]) == 1
         response: str = results["replies"][0]
         assert "Paris" in response
 
-        metadata = results["metadata"][0]
-        assert "gpt-3.5" in metadata["model"]
+        metadata = results["meta"][0]
+        assert "gpt-4o-mini" in metadata["model"]
         assert metadata["finish_reason"] == "stop"
 
         assert "usage" in metadata
@@ -290,8 +254,8 @@ class TestGPTGenerator:
     )
     @pytest.mark.integration
     def test_live_run_wrong_model(self):
-        component = GPTGenerator(model_name="something-obviously-wrong", api_key=os.environ.get("OPENAI_API_KEY"))
-        with pytest.raises(openai.InvalidRequestError, match="The model `something-obviously-wrong` does not exist"):
+        component = OpenAIGenerator(model="something-obviously-wrong")
+        with pytest.raises(OpenAIError):
             component.run("Whatever")
 
     @pytest.mark.skipif(
@@ -310,22 +274,83 @@ class TestGPTGenerator:
                 self.responses += chunk.content if chunk.content else ""
 
         callback = Callback()
-        component = GPTGenerator(os.environ.get("OPENAI_API_KEY"), streaming_callback=callback)
+        component = OpenAIGenerator(streaming_callback=callback)
         results = component.run("What's the capital of France?")
 
         assert len(results["replies"]) == 1
-        assert len(results["metadata"]) == 1
+        assert len(results["meta"]) == 1
         response: str = results["replies"][0]
         assert "Paris" in response
 
-        metadata = results["metadata"][0]
+        metadata = results["meta"][0]
 
-        assert "gpt-3.5" in metadata["model"]
+        assert "gpt-4o-mini" in metadata["model"]
         assert metadata["finish_reason"] == "stop"
+
+        assert "completion_start_time" in metadata
+        assert datetime.fromisoformat(metadata["completion_start_time"]) <= datetime.now()
 
         # unfortunately, the usage is not available for streaming calls
         # we keep the key in the metadata for compatibility
         assert "usage" in metadata and len(metadata["usage"]) == 0
+
+        assert callback.counter > 1
+        assert "Paris" in callback.responses
+
+    @pytest.mark.skipif(
+        not os.environ.get("OPENAI_API_KEY", None),
+        reason="Export an env var called OPENAI_API_KEY containing the OpenAI API key to run this test.",
+    )
+    @pytest.mark.integration
+    def test_run_with_system_prompt(self):
+        generator = OpenAIGenerator(
+            model="gpt-4o-mini",
+            system_prompt="You answer in Portuguese, regardless of the language on which a question is asked",
+        )
+        result = generator.run("Can you explain the Pitagoras therom?")
+        assert "teorema" in result["replies"][0].lower()
+
+        result = generator.run(
+            "Can you explain the Pitagoras therom? Repeat the name of the theorem in German.",
+            system_prompt="You answer in German, regardless of the language on which a question is asked.",
+        )
+        assert "pythag" in result["replies"][0].lower()
+
+    @pytest.mark.skipif(
+        not os.environ.get("OPENAI_API_KEY", None),
+        reason="Export an env var called OPENAI_API_KEY containing the OpenAI API key to run this test.",
+    )
+    @pytest.mark.integration
+    def test_live_run_streaming_with_include_usage(self):
+        class Callback:
+            def __init__(self):
+                self.responses = ""
+                self.counter = 0
+
+            def __call__(self, chunk: StreamingChunk) -> None:
+                self.counter += 1
+                self.responses += chunk.content if chunk.content else ""
+
+        callback = Callback()
+        component = OpenAIGenerator(
+            streaming_callback=callback, generation_kwargs={"stream_options": {"include_usage": True}}
+        )
+        results = component.run("What's the capital of France?")
+
+        assert len(results["replies"]) == 1
+        assert len(results["meta"]) == 1
+        response: str = results["replies"][0]
+        assert "Paris" in response
+
+        metadata = results["meta"][0]
+
+        assert "gpt-4o-mini" in metadata["model"]
+        assert metadata["finish_reason"] == "stop"
+
+        assert "usage" in metadata
+        assert "prompt_tokens" in metadata["usage"] and metadata["usage"]["prompt_tokens"] > 0
+        assert "completion_tokens" in metadata["usage"] and metadata["usage"]["completion_tokens"] > 0
+        assert "total_tokens" in metadata["usage"] and metadata["usage"]["total_tokens"] > 0
 
         assert callback.counter > 1
         assert "Paris" in callback.responses

@@ -1,17 +1,32 @@
-from typing import List, Any, Union, Dict
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+
 from dataclasses import fields
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
-import pandas as pd
+import dateutil.parser
 
 from haystack.dataclasses import Document
 from haystack.errors import FilterError
 
 
+def raise_on_invalid_filter_syntax(filters: Optional[Dict[str, Any]] = None):
+    """
+    Raise an error if the filter syntax is invalid.
+    """
+    if filters and ("operator" not in filters or "conditions" not in filters):
+        msg = "Invalid filter syntax. See https://docs.haystack.deepset.ai/docs/metadata-filtering for details."
+        raise FilterError(msg)
+
+
 def document_matches_filter(filters: Dict[str, Any], document: Document) -> bool:
     """
     Return whether `filters` match the Document.
-    For a detailed specification of the filters, refer to the DocumentStore.filter_documents() protocol documentation.
+
+    For a detailed specification of the filters, refer to the
+    `DocumentStore.filter_documents()` protocol documentation.
     """
     if "field" in filters:
         return _comparison_condition(filters, document)
@@ -34,12 +49,6 @@ LOGICAL_OPERATORS = {"NOT": _not, "OR": _or, "AND": _and}
 
 
 def _equal(document_value: Any, filter_value: Any) -> bool:
-    if isinstance(document_value, pd.DataFrame):
-        document_value = document_value.to_json()
-
-    if isinstance(filter_value, pd.DataFrame):
-        filter_value = filter_value.to_json()
-
     return document_value == filter_value
 
 
@@ -54,18 +63,48 @@ def _greater_than(document_value: Any, filter_value: Any) -> bool:
 
     if isinstance(document_value, str) or isinstance(filter_value, str):
         try:
-            document_value = datetime.fromisoformat(document_value)
-            filter_value = datetime.fromisoformat(filter_value)
+            document_value = _parse_date(document_value)
+            filter_value = _parse_date(filter_value)
+            document_value, filter_value = _ensure_both_dates_naive_or_aware(document_value, filter_value)
+        except FilterError as exc:
+            raise exc
+    if isinstance(filter_value, list):
+        msg = f"Filter value can't be of type {type(filter_value)} using operators '>', '>=', '<', '<='"
+        raise FilterError(msg)
+    return document_value > filter_value
+
+
+def _parse_date(value):
+    """Try parsing the value as an ISO format date, then fall back to dateutil.parser."""
+    try:
+        return datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        try:
+            return dateutil.parser.parse(value)
         except (ValueError, TypeError) as exc:
             msg = (
                 "Can't compare strings using operators '>', '>=', '<', '<='. "
                 "Strings are only comparable if they are ISO formatted dates."
             )
             raise FilterError(msg) from exc
-    if type(filter_value) in [list, pd.DataFrame]:
-        msg = f"Filter value can't be of type {type(filter_value)} using operators '>', '>=', '<', '<='"
-        raise FilterError(msg)
-    return document_value > filter_value
+
+
+def _ensure_both_dates_naive_or_aware(date1: datetime, date2: datetime):
+    """Ensure that both dates are either naive or aware."""
+    # Both naive
+    if date1.tzinfo is None and date2.tzinfo is None:
+        return date1, date2
+
+    # Both aware
+    if date1.tzinfo is not None and date2.tzinfo is not None:
+        return date1, date2
+
+    # One naive, one aware
+    if date1.tzinfo is None:
+        date1 = date1.replace(tzinfo=date2.tzinfo)
+    else:
+        date2 = date2.replace(tzinfo=date1.tzinfo)
+    return date1, date2
 
 
 def _greater_than_equal(document_value: Any, filter_value: Any) -> bool:
@@ -169,137 +208,3 @@ def _comparison_condition(condition: Dict[str, Any], document: Document) -> bool
     operator: str = condition["operator"]
     filter_value: Any = condition["value"]
     return COMPARISON_OPERATORS[operator](filter_value=filter_value, document_value=document_value)
-
-
-def convert(filters: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Convert a filter declared using the legacy style into the new style.
-    This is mostly meant to ease migration from Haystack 1.x to 2.x for developers
-    of Document Stores and Components that use filters.
-
-    This function doesn't verify if `filters` are declared using the legacy style.
-
-    Example usage:
-    ```python
-    legacy_filter = {
-        "$and": {
-            "type": {"$eq": "article"},
-            "date": {"$gte": "2015-01-01", "$lt": "2021-01-01"},
-            "rating": {"$gte": 3},
-            "$or": {"genre": {"$in": ["economy", "politics"]}, "publisher": {"$eq": "nytimes"}},
-        }
-    }
-    assert convert(legacy_filter) == {
-        "operator": "AND",
-        "conditions": [
-            {"field": "type", "operator": "==", "value": "article"},
-            {"field": "date", "operator": ">=", "value": "2015-01-01"},
-            {"field": "date", "operator": "<", "value": "2021-01-01"},
-            {"field": "rating", "operator": ">=", "value": 3},
-            {
-                "operator": "OR",
-                "conditions": [
-                    {"field": "genre", "operator": "in", "value": ["economy", "politics"]},
-                    {"field": "publisher", "operator": "==", "value": "nytimes"},
-                ],
-            },
-        ],
-    }
-    ```
-    """
-    if not isinstance(filters, dict):
-        msg = f"Can't convert filters from type '{type(filters)}'"
-        raise ValueError(msg)
-
-    converted = _internal_convert(filters)
-    if "conditions" not in converted:
-        # This is done to handle a corner case when filter is really simple like so:
-        #   {"text": "A Foo Document 1"}
-        # The root '$and' operator is implicit so the conversion doesn't handle
-        # it and it must be added explicitly like so.
-        # This only happens for simple filters like the one above.
-        return {"operator": "AND", "conditions": [converted]}
-    return converted
-
-
-def _internal_convert(filters: Union[List[Any], Dict[str, Any]], previous_key=None) -> Any:
-    """
-    Recursively convert filters from legacy to new style.
-    """
-    conditions = []
-
-    if isinstance(filters, list) and (result := _handle_list(filters, previous_key)) is not None:
-        return result
-
-    if not isinstance(filters, dict):
-        return _handle_non_dict(filters, previous_key)
-
-    for key, value in filters.items():
-        if (
-            previous_key is not None
-            and previous_key not in ALL_LEGACY_OPERATORS_MAPPING
-            and key not in ALL_LEGACY_OPERATORS_MAPPING
-        ):
-            msg = f"This filter ({filters}) seems to be malformed."
-            raise FilterError(msg)
-        if key not in ALL_LEGACY_OPERATORS_MAPPING:
-            converted = _internal_convert(value, previous_key=key)
-            if isinstance(converted, list):
-                conditions.extend(converted)
-            else:
-                conditions.append(converted)
-        elif key in LEGACY_LOGICAL_OPERATORS_MAPPING:
-            if previous_key not in ALL_LEGACY_OPERATORS_MAPPING and isinstance(value, list):
-                converted = [_internal_convert({previous_key: v}) for v in value]
-                conditions.append({"operator": ALL_LEGACY_OPERATORS_MAPPING[key], "conditions": converted})
-            else:
-                converted = _internal_convert(value, previous_key=key)
-                if key == "$not" and type(converted) not in [dict, list]:
-                    # This handles a corner when '$not' is used like this:
-                    # '{"page": {"$not": 102}}'
-                    # Without this check we would miss the implicit '$eq'
-                    converted = {"field": previous_key, "operator": "==", "value": value}
-                if not isinstance(converted, list):
-                    converted = [converted]
-                conditions.append({"operator": ALL_LEGACY_OPERATORS_MAPPING[key], "conditions": converted})
-        elif key in LEGACY_COMPARISON_OPERATORS_MAPPING:
-            conditions.append({"field": previous_key, "operator": ALL_LEGACY_OPERATORS_MAPPING[key], "value": value})
-
-    if len(conditions) == 1:
-        return conditions[0]
-
-    if previous_key is None:
-        return {"operator": "AND", "conditions": conditions}
-
-    return conditions
-
-
-def _handle_list(filters, previous_key):
-    if previous_key in LEGACY_LOGICAL_OPERATORS_MAPPING:
-        return [_internal_convert(f) for f in filters]
-    elif previous_key not in LEGACY_COMPARISON_OPERATORS_MAPPING:
-        return {"field": previous_key, "operator": "in", "value": filters}
-    return None
-
-
-def _handle_non_dict(filters, previous_key):
-    if previous_key not in ALL_LEGACY_OPERATORS_MAPPING:
-        return {"field": previous_key, "operator": "==", "value": filters}
-    return filters
-
-
-# Operator mappings from legacy style to new one
-LEGACY_LOGICAL_OPERATORS_MAPPING = {"$and": "AND", "$or": "OR", "$not": "NOT"}
-
-LEGACY_COMPARISON_OPERATORS_MAPPING = {
-    "$eq": "==",
-    "$ne": "!=",
-    "$gt": ">",
-    "$gte": ">=",
-    "$lt": "<",
-    "$lte": "<=",
-    "$in": "in",
-    "$nin": "not in",
-}
-
-ALL_LEGACY_OPERATORS_MAPPING = {**LEGACY_LOGICAL_OPERATORS_MAPPING, **LEGACY_COMPARISON_OPERATORS_MAPPING}

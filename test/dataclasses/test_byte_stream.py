@@ -1,8 +1,9 @@
-import io
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+import pytest
 
 from haystack.dataclasses import ByteStream
-
-import pytest
 
 
 def test_from_file_path(tmp_path, request):
@@ -19,6 +20,10 @@ def test_from_file_path(tmp_path, request):
     assert b.data == test_bytes
     assert b.mime_type == "text/plain"
 
+    b = ByteStream.from_file_path(test_path, meta={"foo": "bar"})
+    assert b.data == test_bytes
+    assert b.meta == {"foo": "bar"}
+
 
 def test_from_string():
     test_string = "Hello, world!"
@@ -30,6 +35,34 @@ def test_from_string():
     assert b.data.decode() == test_string
     assert b.mime_type == "text/plain"
 
+    b = ByteStream.from_string(test_string, meta={"foo": "bar"})
+    assert b.data.decode() == test_string
+    assert b.meta == {"foo": "bar"}
+
+
+def test_to_string():
+    test_string = "Hello, world!"
+    b = ByteStream.from_string(test_string)
+    assert b.to_string() == test_string
+
+
+def test_to_from_string_encoding():
+    test_string = "Hello Baščaršija!"
+    with pytest.raises(UnicodeEncodeError):
+        ByteStream.from_string(test_string, encoding="ISO-8859-1")
+
+    bs = ByteStream.from_string(test_string)  # default encoding is utf-8
+
+    assert bs.to_string(encoding="ISO-8859-1") != test_string
+    assert bs.to_string(encoding="utf-8") == test_string
+
+
+def test_to_string_encoding_error():
+    # test that it raises ValueError if the encoding is not valid
+    b = ByteStream.from_string("Hello, world!")
+    with pytest.raises(UnicodeDecodeError):
+        b.to_string("utf-16")
+
 
 def test_to_file(tmp_path, request):
     test_str = "Hello, world!\n"
@@ -38,3 +71,12 @@ def test_to_file(tmp_path, request):
     ByteStream(test_str.encode()).to_file(test_path)
     with open(test_path, "rb") as fd:
         assert fd.read().decode() == test_str
+
+
+def test_str_truncation():
+    test_str = "1234567890" * 100
+    b = ByteStream.from_string(test_str, mime_type="text/plain", meta={"foo": "bar"})
+    string_repr = str(b)
+    assert len(string_repr) < 200
+    assert "text/plain" in string_repr
+    assert "foo" in string_repr

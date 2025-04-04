@@ -1,18 +1,29 @@
-from typing import List, Optional, Union, Dict, Any
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
 
-from haystack import component, Document, default_to_dict
+from typing import Any, Dict, List, Literal, Optional
+
+from haystack import Document, component, default_from_dict, default_to_dict
 from haystack.components.embedders.backends.sentence_transformers_backend import (
     _SentenceTransformersEmbeddingBackendFactory,
 )
+from haystack.utils import ComponentDevice, Secret, deserialize_secrets_inplace
+from haystack.utils.hf import deserialize_hf_model_kwargs, serialize_hf_model_kwargs
 
 
 @component
 class SentenceTransformersDocumentEmbedder:
     """
-    A component for computing Document embeddings using Sentence Transformers models.
-    The embedding of each Document is stored in the `embedding` field of the Document.
+    Calculates document embeddings using Sentence Transformers models.
 
-    Usage example:
+    It stores the embeddings in the `embedding` metadata field of each document.
+    You can also embed documents' metadata.
+    Use this component in indexing pipelines to embed input documents
+    and send them to DocumentWriter to write a into a Document Store.
+
+    ### Usage example:
+
     ```python
     from haystack import Document
     from haystack.components.embedders import SentenceTransformersDocumentEmbedder
@@ -27,105 +38,203 @@ class SentenceTransformersDocumentEmbedder:
     ```
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 # pylint: disable=too-many-positional-arguments
         self,
-        model_name_or_path: str = "sentence-transformers/all-mpnet-base-v2",
-        device: Optional[str] = None,
-        token: Union[bool, str, None] = None,
+        model: str = "sentence-transformers/all-mpnet-base-v2",
+        device: Optional[ComponentDevice] = None,
+        token: Optional[Secret] = Secret.from_env_var(["HF_API_TOKEN", "HF_TOKEN"], strict=False),
         prefix: str = "",
         suffix: str = "",
         batch_size: int = 32,
         progress_bar: bool = True,
         normalize_embeddings: bool = False,
-        metadata_fields_to_embed: Optional[List[str]] = None,
+        meta_fields_to_embed: Optional[List[str]] = None,
         embedding_separator: str = "\n",
+        trust_remote_code: bool = False,
+        truncate_dim: Optional[int] = None,
+        model_kwargs: Optional[Dict[str, Any]] = None,
+        tokenizer_kwargs: Optional[Dict[str, Any]] = None,
+        config_kwargs: Optional[Dict[str, Any]] = None,
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = "float32",
+        encode_kwargs: Optional[Dict[str, Any]] = None,
+        backend: Literal["torch", "onnx", "openvino"] = "torch",
     ):
         """
-        Create a SentenceTransformersDocumentEmbedder component.
+        Creates a SentenceTransformersDocumentEmbedder component.
 
-        :param model_name_or_path: Local path or name of the model in Hugging Face's model hub,
-            such as ``'sentence-transformers/all-mpnet-base-v2'``.
-        :param device: Device (like 'cuda' / 'cpu') that should be used for computation.
-            Defaults to CPU.
-        :param token: The API token used to download private models from Hugging Face.
-            If this parameter is set to `True`, then the token generated when running
-            `transformers-cli login` (stored in ~/.huggingface) will be used.
-        :param prefix: A string to add to the beginning of each Document text before embedding.
+        :param model:
+            The model to use for calculating embeddings.
+            Pass a local path or ID of the model on Hugging Face.
+        :param device:
+            The device to use for loading the model.
+            Overrides the default device.
+        :param token:
+            The API token to download private models from Hugging Face.
+        :param prefix:
+            A string to add at the beginning of each document text.
             Can be used to prepend the text with an instruction, as required by some embedding models,
             such as E5 and bge.
-        :param suffix: A string to add to the end of each Document text before embedding.
-        :param batch_size: Number of strings to encode at once.
-        :param progress_bar: If true, displays progress bar during embedding.
-        :param normalize_embeddings: If set to true, returned vectors will have length 1.
-        :param metadata_fields_to_embed: List of meta fields that should be embedded along with the Document content.
-        :param embedding_separator: Separator used to concatenate the meta fields to the Document content.
+        :param suffix:
+            A string to add at the end of each document text.
+        :param batch_size:
+            Number of documents to embed at once.
+        :param progress_bar:
+            If `True`, shows a progress bar when embedding documents.
+        :param normalize_embeddings:
+            If `True`, the embeddings are normalized using L2 normalization, so that each embedding has a norm of 1.
+        :param meta_fields_to_embed:
+            List of metadata fields to embed along with the document text.
+        :param embedding_separator:
+            Separator used to concatenate the metadata fields to the document text.
+        :param trust_remote_code:
+            If `False`, allows only Hugging Face verified model architectures.
+            If `True`, allows custom models and scripts.
+        :param truncate_dim:
+            The dimension to truncate sentence embeddings to. `None` does no truncation.
+            If the model wasn't trained with Matryoshka Representation Learning,
+            truncating embeddings can significantly affect performance.
+        :param model_kwargs:
+            Additional keyword arguments for `AutoModelForSequenceClassification.from_pretrained`
+            when loading the model. Refer to specific model documentation for available kwargs.
+        :param tokenizer_kwargs:
+            Additional keyword arguments for `AutoTokenizer.from_pretrained` when loading the tokenizer.
+            Refer to specific model documentation for available kwargs.
+        :param config_kwargs:
+            Additional keyword arguments for `AutoConfig.from_pretrained` when loading the model configuration.
+        :param precision:
+            The precision to use for the embeddings.
+            All non-float32 precisions are quantized embeddings.
+            Quantized embeddings are smaller and faster to compute, but may have a lower accuracy.
+            They are useful for reducing the size of the embeddings of a corpus for semantic search, among other tasks.
+        :param encode_kwargs:
+            Additional keyword arguments for `SentenceTransformer.encode` when embedding documents.
+            This parameter is provided for fine customization. Be careful not to clash with already set parameters and
+            avoid passing parameters that change the output type.
+        :param backend:
+            The backend to use for the Sentence Transformers model. Choose from "torch", "onnx", or "openvino".
+            Refer to the [Sentence Transformers documentation](https://sbert.net/docs/sentence_transformer/usage/efficiency.html)
+            for more information on acceleration and quantization options.
         """
 
-        self.model_name_or_path = model_name_or_path
-        # TODO: remove device parameter and use Haystack's device management once migrated
-        self.device = device or "cpu"
+        self.model = model
+        self.device = ComponentDevice.resolve_device(device)
         self.token = token
         self.prefix = prefix
         self.suffix = suffix
         self.batch_size = batch_size
         self.progress_bar = progress_bar
         self.normalize_embeddings = normalize_embeddings
-        self.metadata_fields_to_embed = metadata_fields_to_embed or []
+        self.meta_fields_to_embed = meta_fields_to_embed or []
         self.embedding_separator = embedding_separator
+        self.trust_remote_code = trust_remote_code
+        self.truncate_dim = truncate_dim
+        self.model_kwargs = model_kwargs
+        self.tokenizer_kwargs = tokenizer_kwargs
+        self.config_kwargs = config_kwargs
+        self.encode_kwargs = encode_kwargs
+        self.embedding_backend = None
+        self.precision = precision
+        self.backend = backend
 
     def _get_telemetry_data(self) -> Dict[str, Any]:
         """
         Data that is sent to Posthog for usage analytics.
         """
-        return {"model": self.model_name_or_path}
+        return {"model": self.model}
 
     def to_dict(self) -> Dict[str, Any]:
         """
-        Serialize this component to a dictionary.
+        Serializes the component to a dictionary.
+
+        :returns:
+            Dictionary with serialized data.
         """
-        return default_to_dict(
+        serialization_dict = default_to_dict(
             self,
-            model_name_or_path=self.model_name_or_path,
-            device=self.device,
-            token=self.token if not isinstance(self.token, str) else None,  # don't serialize valid tokens
+            model=self.model,
+            device=self.device.to_dict(),
+            token=self.token.to_dict() if self.token else None,
             prefix=self.prefix,
             suffix=self.suffix,
             batch_size=self.batch_size,
             progress_bar=self.progress_bar,
             normalize_embeddings=self.normalize_embeddings,
-            metadata_fields_to_embed=self.metadata_fields_to_embed,
+            meta_fields_to_embed=self.meta_fields_to_embed,
             embedding_separator=self.embedding_separator,
+            trust_remote_code=self.trust_remote_code,
+            truncate_dim=self.truncate_dim,
+            model_kwargs=self.model_kwargs,
+            tokenizer_kwargs=self.tokenizer_kwargs,
+            config_kwargs=self.config_kwargs,
+            precision=self.precision,
+            encode_kwargs=self.encode_kwargs,
+            backend=self.backend,
         )
+        if serialization_dict["init_parameters"].get("model_kwargs") is not None:
+            serialize_hf_model_kwargs(serialization_dict["init_parameters"]["model_kwargs"])
+        return serialization_dict
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SentenceTransformersDocumentEmbedder":
+        """
+        Deserializes the component from a dictionary.
+
+        :param data:
+            Dictionary to deserialize from.
+        :returns:
+            Deserialized component.
+        """
+        init_params = data["init_parameters"]
+        if init_params.get("device") is not None:
+            init_params["device"] = ComponentDevice.from_dict(init_params["device"])
+        deserialize_secrets_inplace(init_params, keys=["token"])
+        if init_params.get("model_kwargs") is not None:
+            deserialize_hf_model_kwargs(init_params["model_kwargs"])
+        return default_from_dict(cls, data)
 
     def warm_up(self):
         """
-        Load the embedding backend.
+        Initializes the component.
         """
-        if not hasattr(self, "embedding_backend"):
+        if self.embedding_backend is None:
             self.embedding_backend = _SentenceTransformersEmbeddingBackendFactory.get_embedding_backend(
-                model_name_or_path=self.model_name_or_path, device=self.device, use_auth_token=self.token
+                model=self.model,
+                device=self.device.to_torch_str(),
+                auth_token=self.token,
+                trust_remote_code=self.trust_remote_code,
+                truncate_dim=self.truncate_dim,
+                model_kwargs=self.model_kwargs,
+                tokenizer_kwargs=self.tokenizer_kwargs,
+                config_kwargs=self.config_kwargs,
+                backend=self.backend,
             )
+            if self.tokenizer_kwargs and self.tokenizer_kwargs.get("model_max_length"):
+                self.embedding_backend.model.max_seq_length = self.tokenizer_kwargs["model_max_length"]
 
     @component.output_types(documents=List[Document])
     def run(self, documents: List[Document]):
         """
-        Embed a list of Documents.
-        The embedding of each Document is stored in the `embedding` field of the Document.
+        Embed a list of documents.
+
+        :param documents:
+            Documents to embed.
+
+        :returns:
+            A dictionary with the following keys:
+            - `documents`: Documents with embeddings.
         """
         if not isinstance(documents, list) or documents and not isinstance(documents[0], Document):
             raise TypeError(
                 "SentenceTransformersDocumentEmbedder expects a list of Documents as input."
                 "In case you want to embed a list of strings, please use the SentenceTransformersTextEmbedder."
             )
-        if not hasattr(self, "embedding_backend"):
+        if self.embedding_backend is None:
             raise RuntimeError("The embedding model has not been loaded. Please call warm_up() before running.")
-
-        # TODO: once non textual Documents are properly supported, we should also prepare them for embedding here
 
         texts_to_embed = []
         for doc in documents:
             meta_values_to_embed = [
-                str(doc.meta[key]) for key in self.metadata_fields_to_embed if key in doc.meta and doc.meta[key]
+                str(doc.meta[key]) for key in self.meta_fields_to_embed if key in doc.meta and doc.meta[key]
             ]
             text_to_embed = (
                 self.prefix + self.embedding_separator.join(meta_values_to_embed + [doc.content or ""]) + self.suffix
@@ -137,6 +246,8 @@ class SentenceTransformersDocumentEmbedder:
             batch_size=self.batch_size,
             show_progress_bar=self.progress_bar,
             normalize_embeddings=self.normalize_embeddings,
+            precision=self.precision,
+            **(self.encode_kwargs if self.encode_kwargs else {}),
         )
 
         for doc, emb in zip(documents, embeddings):

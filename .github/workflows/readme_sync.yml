@@ -7,6 +7,14 @@ on:
   push:
     branches:
       - main
+      # release branches have the form v1.9.x
+      - "v[0-9]+.[0-9]+.x"
+      # Exclude 1.x release branches, there's another workflow handling those
+      - "!v1.[0-9]+.x"
+
+env:
+  HATCH_VERSION: "1.13.0"
+  PYTHON_VERSION: "3.10"
 
 jobs:
   sync:
@@ -18,12 +26,10 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "${{ env.PYTHON_VERSION }}"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r docs/pydoc/requirements.txt
+      - name: Install Hatch
+        run: pip install hatch==${{ env.HATCH_VERSION }}
 
       - name: Generate API docs
         env:
@@ -31,14 +37,29 @@ jobs:
           # from Readme.io as we need them to associate the slug
           # in config files with their id.
           README_API_KEY: ${{ secrets.README_API_KEY }}
-        run: ./.github/utils/pydoc-markdown.sh
+        # The command is a bit misleading, we're not actually syncing anything here,
+        # we're just generating the markdown files from the yaml configs.
+        run: hatch run readme:sync
 
-      - name: Sync preview docs with 2.0
-        # Sync the preview docs to the `2.0` version on Readme
-        id: sync-main
-        if: github.ref_name == 'main' && github.event_name == 'push'
-        uses: readmeio/rdme@8.3.1
+      - name: Get version
+        id: version-getter
+        run: |
+          VERSION="$(hatch version | cut -d '.' -f 1,2)"
+          CURRENT_BRANCH="${{ github.ref_name }}"
+          # If we're on `main` branch we should push docs to the unstable version
+          if [ "$CURRENT_BRANCH" = "main" ]; then
+            VERSION="$VERSION-unstable"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Sync docs
+        if: github.event_name == 'push'
+        uses: readmeio/rdme@v9
+        with:
+          rdme: docs ./docs/pydoc/temp --key=${{ secrets.README_API_KEY }} --version=${{ steps.version-getter.outputs.version }}
+
+      - name: Delete outdated
+        if: github.event_name == 'push'
         env:
           README_API_KEY: ${{ secrets.README_API_KEY }}
-        with:
-          rdme: docs ./docs/pydoc/temp --key="$README_API_KEY" --version=2.0
+        run: hatch run readme:delete-outdated  --version="${{ steps.version-getter.outputs.version }}" --config-path ./docs/pydoc/config

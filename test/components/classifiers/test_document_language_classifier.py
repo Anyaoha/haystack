@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
 import logging
 import pytest
 
@@ -27,7 +30,7 @@ class TestDocumentLanguageClassifier:
 
     def test_detect_language(self):
         classifier = DocumentLanguageClassifier()
-        detected_language = classifier.detect_language(Document(content="This is an english sentence."))
+        detected_language = classifier._detect_language(Document(content="This is an english sentence."))
         assert detected_language == "en"
 
     def test_classify_as_en_and_unmatched(self):

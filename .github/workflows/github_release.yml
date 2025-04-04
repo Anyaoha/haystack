@@ -4,7 +4,9 @@ on:
   workflow_dispatch:  # this is useful to re-generate the release page without a new tag being pushed
   push:
     tags:
-      - "v[0-9].[0-9]+.[0-9]+*"
+      - "v2.[0-9]+.[0-9]+*"
+      # Ignore release versions tagged with -rc0 suffix
+      - "!v2.[0-9]+.[0-9]-rc0"
 
 jobs:
   generate-notes:
@@ -20,23 +22,34 @@ jobs:
       - name: Parse version
         id: version
         run: |
-          echo "current_release=$(awk -F \- {'print $1'} < VERSION.txt)" >> "$GITHUB_OUTPUT"
-          echo "current_pre_release=$(awk -F \- {'print $2'} < VERSION.txt)" >> "$GITHUB_OUTPUT"
+          echo "current_release=$(awk -F \\- '{print $1}' < VERSION.txt)" >> "$GITHUB_OUTPUT"
+          echo "current_pre_release=$(awk -F \\- '{print $2}' < VERSION.txt)" >> "$GITHUB_OUTPUT"
 
       - name: Install reno
         run: |
           python -m pip install --upgrade pip
           pip install "reno<5"
 
-      - name: Generate release notes for release candidates
-        if: steps.version.outputs.current_pre_release != ''
+      - name: Generate release notes for release candidates - minor releases
+        if: steps.version.outputs.current_pre_release != '' && endsWith(steps.version.outputs.current_release, '.0')
         env:
-          # When generating notes for release candidates, pick every vX.Y.Z-rcN but
+          # When generating notes for release candidates of minor versions, pick every vX.Y.Z-rcN but
           # stop when encounter vX.Y.Z-rc0. The -rc0 tag is added automatically when
           # we create the release branch, so we can assume it's always there.
           EARLIEST_VERSION: v${{ steps.version.outputs.current_release }}-rc0
         run: |
-          reno report --no-show-source --ignore-cache --earliest-version $EARLIEST_VERSION -o relnotes.rst
+          reno report --no-show-source --ignore-cache --earliest-version "$EARLIEST_VERSION" -o relnotes.rst
+
+      - name: Generate release notes for release candidates - bugfix releases
+        if: steps.version.outputs.current_pre_release != '' && !endsWith(steps.version.outputs.current_release, '.0')
+        env:
+          # When generating notes for release candidates of bugfix releases, pick every vX.Y.Z-rcN but
+          # stop when encounter vX.Y.Z-rc1.
+          # In this case, we don't have the -rc0 tag, because we don't need to go through commits on main,
+          # as we cherry-pick them into the release branch.
+          EARLIEST_VERSION: v${{ steps.version.outputs.current_release }}-rc1
+        run: |
+          reno report --no-show-source --ignore-cache --earliest-version "$EARLIEST_VERSION" -o relnotes.rst
 
       - name: Generate release notes for the final release
         if: steps.version.outputs.current_pre_release == ''
@@ -53,3 +66,9 @@ jobs:
       - name: Debug
         run: |
           cat relnotes.md
+
+      - uses: ncipollo/release-action@v1
+        with:
+          bodyFile: "relnotes.md"
+          prerelease: ${{ steps.version.outputs.current_pre_release }}
+          allowUpdates: true

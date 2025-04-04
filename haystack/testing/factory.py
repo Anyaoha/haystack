@@ -1,9 +1,13 @@
-from typing import Any, Dict, Optional, Tuple, Type, List, Union
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
 
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
+
+from haystack.core.component import Component, component
+from haystack.core.serialization import default_from_dict, default_to_dict
 from haystack.dataclasses import Document
-from haystack.document_stores import DocumentStore, DuplicatePolicy
-from haystack.core.component import component, Component
-from haystack.core.serialization import default_to_dict, default_from_dict
+from haystack.document_stores.types import DocumentStore, DuplicatePolicy
 
 
 def document_store_class(
@@ -35,7 +39,7 @@ def document_store_class(
 
     Create a DocumentStore class that returns a single document:
     ```python
-    doc = Document(id="fake_id", text="Fake content")
+    doc = Document(id="fake_id", content="Fake content")
     MyFakeStore = document_store_class("MyFakeComponent", documents=[doc])
     document_store = MyFakeStore()
     assert document_store.documents_count() == 1
@@ -52,7 +56,7 @@ def document_store_class(
 
     Create a DocumentStore class that returns a document and a custom count:
     ```python
-    doc = Document(id="fake_id", text="Fake content")
+    doc = Document(id="fake_id", content="Fake content")
     MyFakeStore = document_store_class("MyFakeComponent", documents=[doc], documents_count=100)
     document_store = MyFakeStore()
     assert document_store.documents_count() == 100
@@ -120,7 +124,7 @@ def document_store_class(
     return cls
 
 
-def component_class(
+def component_class(  # pylint: disable=too-many-positional-arguments
     name: str,
     input_types: Optional[Dict[str, Any]] = None,
     output_types: Optional[Dict[str, Any]] = None,
@@ -210,7 +214,7 @@ def component_class(
     def run(self, **kwargs):  # pylint: disable=unused-argument
         if output is not None:
             return output
-        return {name: None for name in output_types.keys()}
+        return dict.fromkeys(output_types.keys())
 
     def to_dict(self):
         return default_to_dict(self)

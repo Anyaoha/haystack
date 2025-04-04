@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
 import sys
 from unittest.mock import Mock
 
@@ -5,9 +8,15 @@ import pytest
 
 from haystack.core.pipeline import Pipeline
 from haystack.core.component import component
-from haystack.core.errors import DeserializationError
+from haystack.core.errors import DeserializationError, SerializationError
 from haystack.testing import factory
-from haystack.core.serialization import default_to_dict, default_from_dict
+from haystack.core.serialization import (
+    default_to_dict,
+    default_from_dict,
+    generate_qualified_class_name,
+    import_class_by_name,
+    component_to_dict,
+)
 
 
 def test_default_component_to_dict():
@@ -54,7 +63,6 @@ def test_default_component_from_dict_unregistered_component(request):
 def test_from_dict_import_type():
     pipeline_dict = {
         "metadata": {},
-        "max_loops_allowed": 100,
         "components": {
             "greeter": {
                 "type": "haystack.testing.sample_components.greet.Greet",
@@ -77,3 +85,45 @@ def test_from_dict_import_type():
     from haystack.testing.sample_components.greet import Greet
 
     assert type(p.get_component("greeter")) == Greet
+
+
+def test_get_qualified_class_name():
+    MyComponent = factory.component_class("MyComponent")
+    comp = MyComponent()
+    res = generate_qualified_class_name(type(comp))
+    assert res == "haystack.testing.factory.MyComponent"
+
+
+def test_import_class_by_name():
+    data = "haystack.core.pipeline.Pipeline"
+    class_object = import_class_by_name(data)
+    class_instance = class_object()
+    assert isinstance(class_instance, Pipeline)
+
+
+def test_import_class_by_name_no_valid_class():
+    data = "some.invalid.class"
+    with pytest.raises(ImportError):
+        import_class_by_name(data)
+
+
+class CustomData:
+    def __init__(self, a: int, b: str) -> None:
+        self.a = a
+        self.b = b
+
+
+@component()
+class UnserializableClass:
+    def __init__(self, a: int, b: str, c: CustomData) -> None:
+        self.a = a
+        self.b = b
+        self.c = c
+
+    def run(self):
+        pass
+
+
+def test_component_to_dict_invalid_type():
+    with pytest.raises(SerializationError, match="unsupported value of type 'CustomData'"):
+        component_to_dict(UnserializableClass(1, "s", CustomData(99, "aa")), "invalid_component")

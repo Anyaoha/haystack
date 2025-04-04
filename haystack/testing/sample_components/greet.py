@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
 #
 # SPDX-License-Identifier: Apache-2.0
-from typing import Optional
-import logging
 
+import logging
+from typing import Optional
+
+import haystack.logging as haystack_logging
 from haystack.core.component import component
 
-
-logger = logging.getLogger(__name__)
+logger = haystack_logging.getLogger(__name__)
 
 
 @component
@@ -18,6 +19,8 @@ class Greet:
 
     def __init__(self, message: str = "\nGreeting component says: Hi! The value is {value}\n", log_level: str = "INFO"):
         """
+        Class constructor
+
         :param message: the message to log. Can use `{value}` to embed the value.
         :param log_level: the level to log at.
         """

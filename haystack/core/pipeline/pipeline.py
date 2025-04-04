@@ -1,665 +1,273 @@
 # SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
 #
 # SPDX-License-Identifier: Apache-2.0
-from typing import Optional, Any, Dict, List, Union, TypeVar, Type, Set
 
-import os
-import json
-import datetime
-import logging
-import importlib
-from pathlib import Path
 from copy import deepcopy
-from collections import defaultdict
+from typing import Any, Dict, Mapping, Optional, Set, cast
 
-import networkx  # type:ignore
-
-from haystack.core.component import component, Component, InputSocket, OutputSocket
-from haystack.core.errors import (
-    PipelineError,
-    PipelineConnectError,
-    PipelineMaxLoops,
-    PipelineRuntimeError,
-    PipelineValidationError,
-)
-from haystack.core.pipeline.descriptions import find_pipeline_outputs
-from haystack.core.pipeline.draw.draw import _draw, _convert_for_debug, RenderingEngines
-from haystack.core.pipeline.validation import validate_pipeline_input, find_pipeline_inputs
-from haystack.core.component.connection import Connection, parse_connect_string
-from haystack.core.type_utils import _type_name
-from haystack.core.serialization import component_to_dict, component_from_dict
+from haystack import logging, tracing
+from haystack.core.component import Component
+from haystack.core.errors import PipelineRuntimeError
+from haystack.core.pipeline.base import ComponentPriority, PipelineBase
+from haystack.telemetry import pipeline_running
 
 logger = logging.getLogger(__name__)
 
-# We use a generic type to annotate the return value of classmethods,
-# so that static analyzers won't be confused when derived classes
-# use those methods.
-T = TypeVar("T", bound="Pipeline")
 
-
-class Pipeline:
+class Pipeline(PipelineBase):
     """
-    Components orchestration engine.
+    Synchronous version of the orchestration engine.
 
-    Builds a graph of components and orchestrates their execution according to the execution graph.
+    Orchestrates component execution according to the execution graph, one after the other.
     """
 
-    def __init__(
+    def _run_component(
         self,
-        metadata: Optional[Dict[str, Any]] = None,
-        max_loops_allowed: int = 100,
-        debug_path: Union[Path, str] = Path(".canals_debug/"),
-    ):
+        component: Dict[str, Any],
+        inputs: Dict[str, Any],
+        component_visits: Dict[str, int],
+        parent_span: Optional[tracing.Span] = None,
+    ) -> Dict[str, Any]:
         """
-        Creates the Pipeline.
+        Runs a Component with the given inputs.
 
-        Args:
-            metadata: arbitrary dictionary to store metadata about this pipeline. Make sure all the values contained in
-                this dictionary can be serialized and deserialized if you wish to save this pipeline to file with
-                `save_pipelines()/load_pipelines()`.
-            max_loops_allowed: how many times the pipeline can run the same node before throwing an exception.
-            debug_path: when debug is enabled in `run()`, where to save the debug data.
+        :param component: Component with component metadata.
+        :param inputs: Inputs for the Component.
+        :param component_visits: Current state of component visits.
+        :param parent_span: The parent span to use for the newly created span.
+            This is to allow tracing to be correctly linked to the pipeline run.
+        :raises PipelineRuntimeError: If Component doesn't return a dictionary.
+        :return: The output of the Component.
         """
-        self.metadata = metadata or {}
-        self.max_loops_allowed = max_loops_allowed
-        self.graph = networkx.MultiDiGraph()
-        self._connections: List[Connection] = []
-        self._mandatory_connections: Dict[str, List[Connection]] = defaultdict(list)
-        self._debug: Dict[int, Dict[str, Any]] = {}
-        self._debug_path = Path(debug_path)
-
-    def __eq__(self, other) -> bool:
-        """
-        Equal pipelines share every metadata, node and edge, but they're not required to use
-        the same node instances: this allows pipeline saved and then loaded back to be equal to themselves.
-        """
-        if (
-            not isinstance(other, type(self))
-            or not getattr(self, "metadata") == getattr(other, "metadata")
-            or not getattr(self, "max_loops_allowed") == getattr(other, "max_loops_allowed")
-            or not hasattr(self, "graph")
-            or not hasattr(other, "graph")
-        ):
-            return False
-
-        return (
-            self.graph.adj == other.graph.adj
-            and self._comparable_nodes_list(self.graph) == self._comparable_nodes_list(other.graph)
-            and self.graph.graph == other.graph.graph
+        instance: Component = component["instance"]
+        component_name = self.get_component_name(instance)
+        component_inputs = self._consume_component_inputs(
+            component_name=component_name, component=component, inputs=inputs
         )
 
-    def to_dict(self) -> Dict[str, Any]:
-        """
-        Returns this Pipeline instance as a dictionary.
-        This is meant to be an intermediate representation but it can be also used to save a pipeline to file.
-        """
-        components = {}
-        for name, instance in self.graph.nodes(data="instance"):  # type:ignore
-            components[name] = component_to_dict(instance)
+        # We need to add missing defaults using default values from input sockets because the run signature
+        # might not provide these defaults for components with inputs defined dynamically upon component initialization
+        component_inputs = self._add_missing_input_defaults(component_inputs, component["input_sockets"])
 
-        connections = []
-        for sender, receiver, edge_data in self.graph.edges.data():
-            sender_socket = edge_data["from_socket"].name
-            receiver_socket = edge_data["to_socket"].name
-            connections.append({"sender": f"{sender}.{sender_socket}", "receiver": f"{receiver}.{receiver_socket}"})
-        return {
-            "metadata": self.metadata,
-            "max_loops_allowed": self.max_loops_allowed,
-            "components": components,
-            "connections": connections,
-        }
-
-    @classmethod
-    def from_dict(cls: Type[T], data: Dict[str, Any], **kwargs) -> T:
-        """
-        Creates a Pipeline instance from a dictionary.
-        A sample `data` dictionary could be formatted like so:
-        ```
-        {
-            "metadata": {"test": "test"},
-            "max_loops_allowed": 100,
-            "components": {
-                "add_two": {
-                    "type": "AddFixedValue",
-                    "init_parameters": {"add": 2},
+        with tracing.tracer.trace(
+            "haystack.component.run",
+            tags={
+                "haystack.component.name": component_name,
+                "haystack.component.type": instance.__class__.__name__,
+                "haystack.component.input_types": {k: type(v).__name__ for k, v in component_inputs.items()},
+                "haystack.component.input_spec": {
+                    key: {
+                        "type": (value.type.__name__ if isinstance(value.type, type) else str(value.type)),
+                        "senders": value.senders,
+                    }
+                    for key, value in instance.__haystack_input__._sockets_dict.items()  # type: ignore
                 },
-                "add_default": {
-                    "type": "AddFixedValue",
-                    "init_parameters": {"add": 1},
-                },
-                "double": {
-                    "type": "Double",
+                "haystack.component.output_spec": {
+                    key: {
+                        "type": (value.type.__name__ if isinstance(value.type, type) else str(value.type)),
+                        "receivers": value.receivers,
+                    }
+                    for key, value in instance.__haystack_output__._sockets_dict.items()  # type: ignore
                 },
             },
-            "connections": [
-                {"sender": "add_two.result", "receiver": "double.value"},
-                {"sender": "double.value", "receiver": "add_default.value"},
-            ],
-        }
+            parent_span=parent_span,
+        ) as span:
+            # We deepcopy the inputs otherwise we might lose that information
+            # when we delete them in case they're sent to other Components
+            span.set_content_tag("haystack.component.input", deepcopy(component_inputs))
+            logger.info("Running component {component_name}", component_name=component_name)
+            try:
+                component_output = instance.run(**component_inputs)
+            except Exception as error:
+                raise PipelineRuntimeError(
+                    f"The following component failed to run:\n"
+                    f"Component name: '{component_name}'\n"
+                    f"Component type: '{instance.__class__.__name__}'\n"
+                    f"Error: {str(error)}"
+                ) from error
+            component_visits[component_name] += 1
+
+            if not isinstance(component_output, Mapping):
+                raise PipelineRuntimeError(
+                    f"Component '{component_name}' didn't return a dictionary. "
+                    "Components must always return dictionaries: check the documentation."
+                )
+
+            span.set_tag("haystack.component.visits", component_visits[component_name])
+            span.set_content_tag("haystack.component.output", component_output)
+
+            return cast(Dict[Any, Any], component_output)
+
+    def run(  # noqa: PLR0915, PLR0912
+        self, data: Dict[str, Any], include_outputs_from: Optional[Set[str]] = None
+    ) -> Dict[str, Any]:
+        """
+        Runs the Pipeline with given input data.
+
+        Usage:
+        ```python
+        from haystack import Pipeline, Document
+        from haystack.utils import Secret
+        from haystack.document_stores.in_memory import InMemoryDocumentStore
+        from haystack.components.retrievers.in_memory import InMemoryBM25Retriever
+        from haystack.components.generators import OpenAIGenerator
+        from haystack.components.builders.answer_builder import AnswerBuilder
+        from haystack.components.builders.prompt_builder import PromptBuilder
+
+        # Write documents to InMemoryDocumentStore
+        document_store = InMemoryDocumentStore()
+        document_store.write_documents([
+            Document(content="My name is Jean and I live in Paris."),
+            Document(content="My name is Mark and I live in Berlin."),
+            Document(content="My name is Giorgio and I live in Rome.")
+        ])
+
+        prompt_template = \"\"\"
+        Given these documents, answer the question.
+        Documents:
+        {% for doc in documents %}
+            {{ doc.content }}
+        {% endfor %}
+        Question: {{question}}
+        Answer:
+        \"\"\"
+
+        retriever = InMemoryBM25Retriever(document_store=document_store)
+        prompt_builder = PromptBuilder(template=prompt_template)
+        llm = OpenAIGenerator(api_key=Secret.from_token(api_key))
+
+        rag_pipeline = Pipeline()
+        rag_pipeline.add_component("retriever", retriever)
+        rag_pipeline.add_component("prompt_builder", prompt_builder)
+        rag_pipeline.add_component("llm", llm)
+        rag_pipeline.connect("retriever", "prompt_builder.documents")
+        rag_pipeline.connect("prompt_builder", "llm")
+
+        # Ask a question
+        question = "Who lives in Paris?"
+        results = rag_pipeline.run(
+            {
+                "retriever": {"query": question},
+                "prompt_builder": {"question": question},
+            }
+        )
+
+        print(results["llm"]["replies"])
+        # Jean lives in Paris
         ```
 
-        Supported kwargs:
-        `components`: a dictionary of {name: instance} to reuse instances of components instead of creating new ones.
+        :param data:
+            A dictionary of inputs for the pipeline's components. Each key is a component name
+            and its value is a dictionary of that component's input parameters:
+            ```
+            data = {
+                "comp1": {"input1": 1, "input2": 2},
+            }
+            ```
+            For convenience, this format is also supported when input names are unique:
+            ```
+            data = {
+                "input1": 1, "input2": 2,
+            }
+            ```
+        :param include_outputs_from:
+            Set of component names whose individual outputs are to be
+            included in the pipeline's output. For components that are
+            invoked multiple times (in a loop), only the last-produced
+            output is included.
+        :returns:
+            A dictionary where each entry corresponds to a component name
+            and its output. If `include_outputs_from` is `None`, this dictionary
+            will only contain the outputs of leaf components, i.e., components
+            without outgoing connections.
+
+        :raises ValueError:
+            If invalid inputs are provided to the pipeline.
+        :raises PipelineRuntimeError:
+            If the Pipeline contains cycles with unsupported connections that would cause
+            it to get stuck and fail running.
+            Or if a Component fails or returns output in an unsupported type.
+        :raises PipelineMaxComponentRuns:
+            If a Component reaches the maximum number of times it can be run in this Pipeline.
         """
-        metadata = data.get("metadata", {})
-        max_loops_allowed = data.get("max_loops_allowed", 100)
-        debug_path = Path(data.get("debug_path", ".canals_debug/"))
-        pipe = cls(metadata=metadata, max_loops_allowed=max_loops_allowed, debug_path=debug_path)
-        components_to_reuse = kwargs.get("components", {})
-        for name, component_data in data.get("components", {}).items():
-            if name in components_to_reuse:
-                # Reuse an instance
-                instance = components_to_reuse[name]
-            else:
-                if "type" not in component_data:
-                    raise PipelineError(f"Missing 'type' in component '{name}'")
+        pipeline_running(self)
 
-                if component_data["type"] not in component.registry:
-                    try:
-                        # Import the module first...
-                        module, _ = component_data["type"].rsplit(".", 1)
-                        logger.debug("Trying to import %s", module)
-                        importlib.import_module(module)
-                        # ...then try again
-                        if component_data["type"] not in component.registry:
-                            raise PipelineError(
-                                f"Successfully imported module {module} but can't find it in the component registry."
-                                "This is unexpected and most likely a bug."
-                            )
-                    except (ImportError, PipelineError) as e:
-                        raise PipelineError(f"Component '{component_data['type']}' not imported.") from e
-
-                # Create a new one
-                component_class = component.registry[component_data["type"]]
-                instance = component_from_dict(component_class, component_data)
-            pipe.add_component(name=name, instance=instance)
-
-        for connection in data.get("connections", []):
-            if "sender" not in connection:
-                raise PipelineError(f"Missing sender in connection: {connection}")
-            if "receiver" not in connection:
-                raise PipelineError(f"Missing receiver in connection: {connection}")
-            pipe.connect(connect_from=connection["sender"], connect_to=connection["receiver"])
-
-        return pipe
-
-    def _comparable_nodes_list(self, graph: networkx.MultiDiGraph) -> List[Dict[str, Any]]:
-        """
-        Replaces instances of nodes with their class name in order to make sure they're comparable.
-        """
-        nodes = []
-        for node in graph.nodes:
-            comparable_node = graph.nodes[node]
-            comparable_node["instance"] = comparable_node["instance"].__class__
-            nodes.append(comparable_node)
-        nodes.sort()
-        return nodes
-
-    def add_component(self, name: str, instance: Component) -> None:
-        """
-        Create a component for the given component. Components are not connected to anything by default:
-        use `Pipeline.connect()` to connect components together.
-
-        Component names must be unique, but component instances can be reused if needed.
-
-        Args:
-            name: the name of the component.
-            instance: the component instance.
-
-        Returns:
-            None
-
-        Raises:
-            ValueError: if a component with the same name already exists
-            PipelineValidationError: if the given instance is not a Canals component
-        """
-        # Component names are unique
-        if name in self.graph.nodes:
-            raise ValueError(f"A component named '{name}' already exists in this pipeline: choose another name.")
-
-        # Components can't be named `_debug`
-        if name == "_debug":
-            raise ValueError("'_debug' is a reserved name for debug output. Choose another name.")
-
-        # Component instances must be components
-        if not isinstance(instance, Component):
-            raise PipelineValidationError(
-                f"'{type(instance)}' doesn't seem to be a component. Is this class decorated with @component?"
-            )
-
-        # Create the component's input and output sockets
-        input_sockets = getattr(instance, "__canals_input__", {})
-        output_sockets = getattr(instance, "__canals_output__", {})
-
-        # Add component to the graph, disconnected
-        logger.debug("Adding component '%s' (%s)", name, instance)
-        self.graph.add_node(
-            name, instance=instance, input_sockets=input_sockets, output_sockets=output_sockets, visits=0
-        )
-
-    def connect(self, connect_from: str, connect_to: str) -> None:
-        """
-        Connects two components together. All components to connect must exist in the pipeline.
-        If connecting to an component that has several output connections, specify the inputs and output names as
-        'component_name.connections_name'.
-
-        Args:
-            connect_from: the component that delivers the value. This can be either just a component name or can be
-                in the format `component_name.connection_name` if the component has multiple outputs.
-            connect_to: the component that receives the value. This can be either just a component name or can be
-                in the format `component_name.connection_name` if the component has multiple inputs.
-
-        Returns:
-            None
-
-        Raises:
-            PipelineConnectError: if the two components cannot be connected (for example if one of the components is
-                not present in the pipeline, or the connections don't match by type, and so on).
-        """
-        # Edges may be named explicitly by passing 'node_name.edge_name' to connect().
-        sender, sender_socket_name = parse_connect_string(connect_from)
-        receiver, receiver_socket_name = parse_connect_string(connect_to)
-
-        # Get the nodes data.
-        try:
-            from_sockets = self.graph.nodes[sender]["output_sockets"]
-        except KeyError as exc:
-            raise ValueError(f"Component named {sender} not found in the pipeline.") from exc
-        try:
-            to_sockets = self.graph.nodes[receiver]["input_sockets"]
-        except KeyError as exc:
-            raise ValueError(f"Component named {receiver} not found in the pipeline.") from exc
-
-        # If the name of either socket is given, get the socket
-        sender_socket: Optional[OutputSocket] = None
-        if sender_socket_name:
-            sender_socket = from_sockets.get(sender_socket_name)
-            if not sender_socket:
-                raise PipelineConnectError(
-                    f"'{connect_from} does not exist. "
-                    f"Output connections of {sender} are: "
-                    + ", ".join([f"{name} (type {_type_name(socket.type)})" for name, socket in from_sockets.items()])
-                )
-
-        receiver_socket: Optional[InputSocket] = None
-        if receiver_socket_name:
-            receiver_socket = to_sockets.get(receiver_socket_name)
-            if not receiver_socket:
-                raise PipelineConnectError(
-                    f"'{connect_to} does not exist. "
-                    f"Input connections of {receiver} are: "
-                    + ", ".join([f"{name} (type {_type_name(socket.type)})" for name, socket in to_sockets.items()])
-                )
-
-        # Look for a matching connection among the possible ones.
-        # Note that if there is more than one possible connection but two sockets match by name, they're paired.
-        sender_socket_candidates: List[OutputSocket] = [sender_socket] if sender_socket else list(from_sockets.values())
-        receiver_socket_candidates: List[InputSocket] = (
-            [receiver_socket] if receiver_socket else list(to_sockets.values())
-        )
-
-        connection = Connection.from_list_of_sockets(
-            sender, sender_socket_candidates, receiver, receiver_socket_candidates
-        )
-
-        # Connection must be valid on both sender/receiver sides
-        if (
-            not connection.sender_socket
-            or not connection.receiver_socket
-            or not connection.sender
-            or not connection.receiver
-        ):
-            raise PipelineConnectError("Connection must have both sender and receiver: {connection}")
-
-        # Create the connection
-        logger.debug(
-            "Connecting '%s.%s' to '%s.%s'",
-            connection.sender,
-            connection.sender_socket.name,
-            connection.receiver,
-            connection.receiver_socket.name,
-        )
-
-        self.graph.add_edge(
-            connection.sender,
-            connection.receiver,
-            key=f"{connection.sender_socket.name}/{connection.receiver_socket.name}",
-            conn_type=_type_name(connection.sender_socket.type),
-            from_socket=connection.sender_socket,
-            to_socket=connection.receiver_socket,
-        )
-
-        self._connections.append(connection)
-        if connection.is_mandatory:
-            self._mandatory_connections[connection.receiver].append(connection)
-
-    def get_component(self, name: str) -> Component:
-        """
-        Returns an instance of a component.
-
-        Args:
-            name: the name of the component
-
-        Returns:
-            The instance of that component.
-
-        Raises:
-            ValueError: if a component with that name is not present in the pipeline.
-        """
-        try:
-            return self.graph.nodes[name]["instance"]
-        except KeyError as exc:
-            raise ValueError(f"Component named {name} not found in the pipeline.") from exc
-
-    def inputs(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Returns a dictionary containing the inputs of a pipeline. Each key in the dictionary
-        corresponds to a component name, and its value is another dictionary that describes the
-        input sockets of that component, including their types and whether they are optional.
-
-        Returns:
-            A dictionary where each key is a pipeline component name and each value is a dictionary of
-            inputs sockets of that component.
-        """
-        inputs = {
-            comp: {socket.name: {"type": socket.type, "is_mandatory": socket.is_mandatory} for socket in data}
-            for comp, data in find_pipeline_inputs(self.graph).items()
-            if data
-        }
-        return inputs
-
-    def outputs(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Returns a dictionary containing the outputs of a pipeline. Each key in the dictionary
-        corresponds to a component name, and its value is another dictionary that describes the
-        output sockets of that component.
-
-        Returns:
-            A dictionary where each key is a pipeline component name and each value is a dictionary of
-            output sockets of that component.
-        """
-        outputs = {
-            comp: {socket.name: {"type": socket.type} for socket in data}
-            for comp, data in find_pipeline_outputs(self.graph).items()
-            if data
-        }
-        return outputs
-
-    def draw(self, path: Path, engine: RenderingEngines = "mermaid-image") -> None:
-        """
-        Draws the pipeline. Requires either `graphviz` as a system dependency, or an internet connection for Mermaid.
-        Run `pip install graphviz` or `pip install mermaid` to install missing dependencies.
-
-        Args:
-            path: where to save the diagram.
-            engine: which format to save the graph as. Accepts 'graphviz', 'mermaid-text', 'mermaid-image'.
-                Default is 'mermaid-image'.
-
-        Returns:
-            None
-
-        Raises:
-            ImportError: if `engine='graphviz'` and `pygraphviz` is not installed.
-            HTTPConnectionError: (and similar) if the internet connection is down or other connection issues.
-        """
-        _draw(graph=networkx.MultiDiGraph(self.graph), path=path, engine=engine)
-
-    def warm_up(self):
-        """
-        Make sure all nodes are warm.
-
-        It's the node's responsibility to make sure this method can be called at every `Pipeline.run()`
-        without re-initializing everything.
-        """
-        for node in self.graph.nodes:
-            if hasattr(self.graph.nodes[node]["instance"], "warm_up"):
-                logger.info("Warming up component %s...", node)
-                self.graph.nodes[node]["instance"].warm_up()
-
-    def run(self, data: Dict[str, Any], debug: bool = False) -> Dict[str, Any]:  # pylint: disable=too-many-locals
-        """
-        Runs the pipeline.
-
-        Args:
-            data: the inputs to give to the input components of the Pipeline.
-            debug: whether to collect and return debug information.
-
-        Returns:
-            A dictionary with the outputs of the output components of the Pipeline.
-
-        Raises:
-            PipelineRuntimeError: if the any of the components fail or return unexpected output.
-        """
-        self._clear_visits_count()
-        data = validate_pipeline_input(self.graph, input_values=data)
-        logger.info("Pipeline execution started.")
-
-        self._debug = {}
-        if debug:
-            logger.info("Debug mode ON.")
-            os.makedirs("debug", exist_ok=True)
-
-        logger.debug(
-            "Mandatory connections:\n%s",
-            "\n".join(
-                f" - {component}: {', '.join([str(s) for s in sockets])}"
-                for component, sockets in self._mandatory_connections.items()
-            ),
-        )
-
+        # TODO: Remove this warmup once we can check reliably whether a component has been warmed up or not
+        # As of now it's here to make sure we don't have failing tests that assume warm_up() is called in run()
         self.warm_up()
 
-        # Prepare the inputs buffers and components queue
-        components_queue: List[str] = []
-        mandatory_values_buffer: Dict[Connection, Any] = {}
-        optional_values_buffer: Dict[Connection, Any] = {}
-        pipeline_output: Dict[str, Dict[str, Any]] = defaultdict(dict)
+        # normalize `data`
+        data = self._prepare_component_input_data(data)
 
-        for node_name, input_data in data.items():
-            for socket_name, value in input_data.items():
-                # Make a copy of the input value so components don't need to
-                # take care of mutability.
-                value = deepcopy(value)
-                connection = Connection(
-                    None, None, node_name, self.graph.nodes[node_name]["input_sockets"][socket_name]
-                )
-                self._add_value_to_buffers(
-                    value, connection, components_queue, mandatory_values_buffer, optional_values_buffer
-                )
+        # Raise ValueError if input is malformed in some way
+        self._validate_input(data)
 
-        # *** PIPELINE EXECUTION LOOP ***
-        step = 0
-        while components_queue:  # pylint: disable=too-many-nested-blocks
-            step += 1
-            if debug:
-                self._record_pipeline_step(
-                    step, components_queue, mandatory_values_buffer, optional_values_buffer, pipeline_output
-                )
+        if include_outputs_from is None:
+            include_outputs_from = set()
 
-            component_name = components_queue.pop(0)
-            logger.debug("> Queue at step %s: %s %s", step, component_name, components_queue)
-            self._check_max_loops(component_name)
+        # We create a list of components in the pipeline sorted by name, so that the algorithm runs deterministically
+        # and independent of insertion order into the pipeline.
+        ordered_component_names = sorted(self.graph.nodes.keys())
 
-            # **** RUN THE NODE ****
-            if not self._ready_to_run(component_name, mandatory_values_buffer, components_queue):
-                continue
+        # We track component visits to decide if a component can run.
+        component_visits = dict.fromkeys(ordered_component_names, 0)
 
-            inputs = {
-                **self._extract_inputs_from_buffer(component_name, mandatory_values_buffer),
-                **self._extract_inputs_from_buffer(component_name, optional_values_buffer),
-            }
-            outputs = self._run_component(name=component_name, inputs=dict(inputs))
+        # We need to access a component's receivers multiple times during a pipeline run.
+        # We store them here for easy access.
+        cached_receivers = {name: self._find_receivers_from(name) for name in ordered_component_names}
 
-            # **** PROCESS THE OUTPUT ****
-            for socket_name, value in outputs.items():
-                targets = self._collect_targets(component_name, socket_name)
-                if not targets:
-                    pipeline_output[component_name][socket_name] = value
-                else:
-                    for target in targets:
-                        self._add_value_to_buffers(
-                            value, target, components_queue, mandatory_values_buffer, optional_values_buffer
-                        )
+        cached_topological_sort = None
 
-        if debug:
-            self._record_pipeline_step(
-                step + 1, components_queue, mandatory_values_buffer, optional_values_buffer, pipeline_output
-            )
-            os.makedirs(self._debug_path, exist_ok=True)
-            with open(self._debug_path / "data.json", "w", encoding="utf-8") as datafile:
-                json.dump(self._debug, datafile, indent=4, default=str)
-            pipeline_output["_debug"] = self._debug  # type: ignore
+        pipeline_outputs: Dict[str, Any] = {}
+        with tracing.tracer.trace(
+            "haystack.pipeline.run",
+            tags={
+                "haystack.pipeline.input_data": data,
+                "haystack.pipeline.output_data": pipeline_outputs,
+                "haystack.pipeline.metadata": self.metadata,
+                "haystack.pipeline.max_runs_per_component": self._max_runs_per_component,
+            },
+        ) as span:
+            inputs = self._convert_to_internal_format(pipeline_inputs=data)
+            priority_queue = self._fill_queue(ordered_component_names, inputs, component_visits)
 
-        logger.info("Pipeline executed successfully.")
-        return dict(pipeline_output)
+            # check if pipeline is blocked before execution
+            self.validate_pipeline(priority_queue)
 
-    def _record_pipeline_step(
-        self, step, components_queue, mandatory_values_buffer, optional_values_buffer, pipeline_output
-    ):
-        """
-        Stores a snapshot of this step into the self.debug dictionary of the pipeline.
-        """
-        mermaid_graph = _convert_for_debug(deepcopy(self.graph))
-        self._debug[step] = {
-            "time": datetime.datetime.now(),
-            "components_queue": components_queue,
-            "mandatory_values_buffer": mandatory_values_buffer,
-            "optional_values_buffer": optional_values_buffer,
-            "pipeline_output": pipeline_output,
-            "diagram": mermaid_graph,
-        }
+            while True:
+                candidate = self._get_next_runnable_component(priority_queue, component_visits)
+                if candidate is None:
+                    break
 
-    def _clear_visits_count(self):
-        """
-        Make sure all nodes's visits count is zero.
-        """
-        for node in self.graph.nodes:
-            self.graph.nodes[node]["visits"] = 0
+                priority, component_name, component = candidate
+                if len(priority_queue) > 0 and priority in [ComponentPriority.DEFER, ComponentPriority.DEFER_LAST]:
+                    component_name, topological_sort = self._tiebreak_waiting_components(
+                        component_name=component_name,
+                        priority=priority,
+                        priority_queue=priority_queue,
+                        topological_sort=cached_topological_sort,
+                    )
+                    cached_topological_sort = topological_sort
+                    component = self._get_component_with_graph_metadata_and_visits(
+                        component_name, component_visits[component_name]
+                    )
 
-    def _check_max_loops(self, component_name: str):
-        """
-        Verify whether this component run too many times.
-        """
-        if self.graph.nodes[component_name]["visits"] > self.max_loops_allowed:
-            raise PipelineMaxLoops(
-                f"Maximum loops count ({self.max_loops_allowed}) exceeded for component '{component_name}'."
-            )
+                component_outputs = self._run_component(component, inputs, component_visits, parent_span=span)
 
-    def _add_value_to_buffers(
-        self,
-        value: Any,
-        connection: Connection,
-        components_queue: List[str],
-        mandatory_values_buffer: Dict[Connection, Any],
-        optional_values_buffer: Dict[Connection, Any],
-    ):
-        """
-        Given a value and the connection it is being sent on, it updates the buffers and the components queue.
-        """
-        if connection.is_mandatory:
-            mandatory_values_buffer[connection] = value
-            if connection.receiver and connection.receiver not in components_queue:
-                components_queue.append(connection.receiver)
-        else:
-            optional_values_buffer[connection] = value
+                # Updates global input state with component outputs and returns outputs that should go to
+                # pipeline outputs.
 
-    def _ready_to_run(
-        self, component_name: str, mandatory_values_buffer: Dict[Connection, Any], components_queue: List[str]
-    ) -> bool:
-        """
-        Returns True if a component is ready to run, False otherwise.
-        """
-        connections_with_value = {conn for conn in mandatory_values_buffer.keys() if conn.receiver == component_name}
-        expected_connections = set(self._mandatory_connections[component_name])
-        if expected_connections.issubset(connections_with_value):
-            logger.debug("Component '%s' is ready to run. All mandatory values were received.", component_name)
-            return True
-
-        # Collect the missing values still being computed we need to wait for
-        missing_connections: Set[Connection] = expected_connections - connections_with_value
-        connections_to_wait = []
-        for missing_conn in missing_connections:
-            if any(
-                networkx.has_path(self.graph, component_to_run, missing_conn.sender)
-                for component_to_run in components_queue
-            ):
-                connections_to_wait.append(missing_conn)
-
-        if not connections_to_wait:
-            # None of the missing values are needed to visit this part of the graph: we can run the component
-            logger.debug(
-                "Component '%s' is ready to run. A variadic input parameter received all the expected values.",
-                component_name,
-            )
-            return True
-
-        # Component can't run, waiting for the values needed by `connections_to_wait`
-        logger.debug(
-            "Component '%s' is not ready to run, some values are still missing: %s", component_name, connections_to_wait
-        )
-        # Put the component back in the queue
-        components_queue.append(component_name)
-        return False
-
-    def _extract_inputs_from_buffer(self, component_name: str, buffer: Dict[Connection, Any]) -> Dict[str, Any]:
-        """
-        Extract a component's input values from one of the value buffers.
-        """
-        inputs = defaultdict(list)
-        connections: List[Connection] = []
-
-        for connection in buffer.keys():
-            if connection.receiver == component_name:
-                connections.append(connection)
-
-        for key in connections:
-            value = buffer.pop(key)
-            if key.receiver_socket:
-                if key.receiver_socket.is_variadic:
-                    inputs[key.receiver_socket.name].append(value)
-                else:
-                    inputs[key.receiver_socket.name] = value
-        return inputs
-
-    def _run_component(self, name: str, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Once we're confident this component is ready to run, run it and collect the output.
-        """
-        self.graph.nodes[name]["visits"] += 1
-        instance = self.graph.nodes[name]["instance"]
-        try:
-            logger.info("* Running %s", name)
-            logger.debug("   '%s' inputs: %s", name, inputs)
-
-            outputs = instance.run(**inputs)
-
-            # Unwrap the output
-            logger.debug("   '%s' outputs: %s\n", name, outputs)
-
-            # Make sure the component returned a dictionary
-            if not isinstance(outputs, dict):
-                raise PipelineRuntimeError(
-                    f"Component '{name}' returned a value of type '{_type_name(type(outputs))}' instead of a dict. "
-                    "Components must always return dictionaries: check the the documentation."
+                component_pipeline_outputs = self._write_component_outputs(
+                    component_name=component_name,
+                    component_outputs=component_outputs,
+                    inputs=inputs,
+                    receivers=cached_receivers[component_name],
+                    include_outputs_from=include_outputs_from,
                 )
 
-        except Exception as e:
-            raise PipelineRuntimeError(
-                f"{name} raised '{e.__class__.__name__}: {e}' \nInputs: {inputs}\n\n"
-                "See the stacktrace above for more information."
-            ) from e
+                if component_pipeline_outputs:
+                    pipeline_outputs[component_name] = deepcopy(component_pipeline_outputs)
+                if self._is_queue_stale(priority_queue):
+                    priority_queue = self._fill_queue(ordered_component_names, inputs, component_visits)
 
-        return outputs
-
-    def _collect_targets(self, component_name: str, socket_name: str) -> List[Connection]:
-        """
-        Given a component and an output socket name, return a list of Connections
-        for which they represent the sender. Used to route output.
-        """
-        return [
-            connection
-            for connection in self._connections
-            if connection.sender == component_name
-            and connection.sender_socket
-            and connection.sender_socket.name == socket_name
-        ]
+            return pipeline_outputs

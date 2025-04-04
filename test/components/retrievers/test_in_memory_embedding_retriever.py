@@ -1,13 +1,16 @@
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
 from typing import Dict, Any
 
 import pytest
-import numpy as np
 
 from haystack import Pipeline, DeserializationError
+from haystack.document_stores.types import FilterPolicy
 from haystack.testing.factory import document_store_class
-from haystack.components.retrievers.in_memory_embedding_retriever import InMemoryEmbeddingRetriever
+from haystack.components.retrievers.in_memory.embedding_retriever import InMemoryEmbeddingRetriever
 from haystack.dataclasses import Document
-from haystack.document_stores import InMemoryDocumentStore
+from haystack.document_stores.in_memory import InMemoryDocumentStore
 
 
 class TestMemoryEmbeddingRetriever:
@@ -37,13 +40,14 @@ class TestMemoryEmbeddingRetriever:
 
         data = component.to_dict()
         assert data == {
-            "type": "haystack.components.retrievers.in_memory_embedding_retriever.InMemoryEmbeddingRetriever",
+            "type": "haystack.components.retrievers.in_memory.embedding_retriever.InMemoryEmbeddingRetriever",
             "init_parameters": {
                 "document_store": {"type": "test_module.MyFakeStore", "init_parameters": {}},
                 "filters": None,
                 "top_k": 10,
                 "scale_score": False,
                 "return_embedding": False,
+                "filter_policy": "replace",
             },
         }
 
@@ -60,19 +64,20 @@ class TestMemoryEmbeddingRetriever:
         )
         data = component.to_dict()
         assert data == {
-            "type": "haystack.components.retrievers.in_memory_embedding_retriever.InMemoryEmbeddingRetriever",
+            "type": "haystack.components.retrievers.in_memory.embedding_retriever.InMemoryEmbeddingRetriever",
             "init_parameters": {
                 "document_store": {"type": "test_module.MyFakeStore", "init_parameters": {}},
                 "filters": {"name": "test.txt"},
                 "top_k": 5,
                 "scale_score": True,
                 "return_embedding": True,
+                "filter_policy": "replace",
             },
         }
 
     def test_from_dict(self):
         data = {
-            "type": "haystack.components.retrievers.in_memory_embedding_retriever.InMemoryEmbeddingRetriever",
+            "type": "haystack.components.retrievers.in_memory.embedding_retriever.InMemoryEmbeddingRetriever",
             "init_parameters": {
                 "document_store": {
                     "type": "haystack.document_stores.in_memory.document_store.InMemoryDocumentStore",
@@ -80,6 +85,7 @@ class TestMemoryEmbeddingRetriever:
                 },
                 "filters": {"name": "test.txt"},
                 "top_k": 5,
+                "filter_policy": "merge",
             },
         }
         component = InMemoryEmbeddingRetriever.from_dict(data)
@@ -87,10 +93,11 @@ class TestMemoryEmbeddingRetriever:
         assert component.filters == {"name": "test.txt"}
         assert component.top_k == 5
         assert component.scale_score is False
+        assert component.filter_policy == FilterPolicy.MERGE
 
     def test_from_dict_without_docstore(self):
         data = {
-            "type": "haystack.components.retrievers.in_memory_embedding_retriever.InMemoryEmbeddingRetriever",
+            "type": "haystack.components.retrievers.in_memory.embedding_retriever.InMemoryEmbeddingRetriever",
             "init_parameters": {},
         }
         with pytest.raises(DeserializationError, match="Missing 'document_store' in serialization data"):
@@ -98,7 +105,7 @@ class TestMemoryEmbeddingRetriever:
 
     def test_from_dict_without_docstore_type(self):
         data = {
-            "type": "haystack.components.retrievers.in_memory_embedding_retriever.InMemoryEmbeddingRetriever",
+            "type": "haystack.components.retrievers.in_memory.embedding_retriever.InMemoryEmbeddingRetriever",
             "init_parameters": {"document_store": {"init_parameters": {}}},
         }
         with pytest.raises(DeserializationError):
@@ -106,7 +113,7 @@ class TestMemoryEmbeddingRetriever:
 
     def test_from_dict_nonexisting_docstore(self):
         data = {
-            "type": "haystack.components.retrievers.in_memory_embedding_retriever.InMemoryEmbeddingRetriever",
+            "type": "haystack.components.retrievers.in_memory.embedding_retriever.InMemoryEmbeddingRetriever",
             "init_parameters": {"document_store": {"type": "Nonexisting.Docstore", "init_parameters": {}}},
         }
         with pytest.raises(DeserializationError):
@@ -127,7 +134,7 @@ class TestMemoryEmbeddingRetriever:
 
         assert "documents" in result
         assert len(result["documents"]) == top_k
-        assert np.array_equal(result["documents"][0].embedding, [1.0, 1.0, 1.0, 1.0])
+        assert result["documents"][0].embedding == [1.0, 1.0, 1.0, 1.0]
 
     def test_invalid_run_wrong_store_type(self):
         SomeOtherDocumentStore = document_store_class("SomeOtherDocumentStore")
@@ -157,4 +164,4 @@ class TestMemoryEmbeddingRetriever:
         results_docs = result["retriever"]["documents"]
         assert results_docs
         assert len(results_docs) == top_k
-        assert np.array_equal(results_docs[0].embedding, [1.0, 1.0, 1.0, 1.0])
+        assert results_docs[0].embedding == [1.0, 1.0, 1.0, 1.0]

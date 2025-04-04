@@ -1,140 +1,195 @@
-from typing import List, Optional, Dict, Any, Union, BinaryIO, Literal, get_args, Sequence
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
 
-import logging
+import tempfile
 from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, Union, get_args
 
-from haystack import component, Document, default_to_dict, ComponentError
+from haystack import Document, component, default_from_dict, default_to_dict
+from haystack.dataclasses import ByteStream
 from haystack.lazy_imports import LazyImport
+from haystack.utils import ComponentDevice
 
-with LazyImport(
-    "Run 'pip install transformers[torch]' to install torch and "
-    "'pip install \"openai-whisper>=20231106\"' to install whisper."
-) as whisper_import:
-    import torch
+with LazyImport("Run 'pip install \"openai-whisper>=20231106\"' to install whisper.") as whisper_import:
     import whisper
 
-
-logger = logging.getLogger(__name__)
-WhisperLocalModel = Literal["tiny", "small", "medium", "large", "large-v2"]
+WhisperLocalModel = Literal[
+    "base",
+    "base.en",
+    "large",
+    "large-v1",
+    "large-v2",
+    "large-v3",
+    "medium",
+    "medium.en",
+    "small",
+    "small.en",
+    "tiny",
+    "tiny.en",
+]
 
 
 @component
 class LocalWhisperTranscriber:
     """
-    Transcribes audio files using OpenAI's Whisper's model on your local machine.
+    Transcribes audio files using OpenAI's Whisper model on your local machine.
 
     For the supported audio formats, languages, and other parameters, see the
     [Whisper API documentation](https://platform.openai.com/docs/guides/speech-to-text) and the official Whisper
-    [github repo](https://github.com/openai/whisper).
+    [GitHub repository](https://github.com/openai/whisper).
+
+    ### Usage example
+
+    ```python
+    from haystack.components.audio import LocalWhisperTranscriber
+
+    whisper = LocalWhisperTranscriber(model="small")
+    whisper.warm_up()
+    transcription = whisper.run(sources=["path/to/audio/file"])
+    ```
     """
 
     def __init__(
         self,
-        model_name_or_path: WhisperLocalModel = "large",
-        device: Optional[str] = None,
+        model: WhisperLocalModel = "large",
+        device: Optional[ComponentDevice] = None,
         whisper_params: Optional[Dict[str, Any]] = None,
     ):
         """
-        :param model_name_or_path: Name of the model to use. Set it to one of the following values:
-        :type model_name_or_path: Literal["tiny", "small", "medium", "large", "large-v2"]
-        :param device: Name of the torch device to use for inference. If None, CPU is used.
-        :type device: Optional[str]
+        Creates an instance of the LocalWhisperTranscriber component.
+
+        :param model:
+            The name of the model to use. Set to one of the following models:
+            "tiny", "base", "small", "medium", "large" (default).
+            For details on the models and their modifications, see the
+            [Whisper documentation](https://github.com/openai/whisper?tab=readme-ov-file#available-models-and-languages).
+        :param device:
+            The device for loading the model. If `None`, automatically selects the default device.
         """
         whisper_import.check()
-        if model_name_or_path not in get_args(WhisperLocalModel):
+        if model not in get_args(WhisperLocalModel):
             raise ValueError(
-                f"Model name '{model_name_or_path}' not recognized. Choose one among: "
-                f"{', '.join(get_args(WhisperLocalModel))}."
+                f"Model name '{model}' not recognized. Choose one among: {', '.join(get_args(WhisperLocalModel))}."
             )
-        self.model_name = model_name_or_path
+        self.model = model
         self.whisper_params = whisper_params or {}
-        self.device = torch.device(device) if device else torch.device("cpu")
+        self.device = ComponentDevice.resolve_device(device)
         self._model = None
 
     def warm_up(self) -> None:
         """
-        Loads the model.
+        Loads the model in memory.
         """
         if not self._model:
-            self._model = whisper.load_model(self.model_name, device=self.device)
+            self._model = whisper.load_model(self.model, device=self.device.to_torch())
 
     def to_dict(self) -> Dict[str, Any]:
         """
-        Serialize this component to a dictionary.
+        Serializes the component to a dictionary.
+
+        :returns:
+            Dictionary with serialized data.
         """
-        return default_to_dict(
-            self, model_name_or_path=self.model_name, device=str(self.device), whisper_params=self.whisper_params
-        )
+        return default_to_dict(self, model=self.model, device=self.device.to_dict(), whisper_params=self.whisper_params)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "LocalWhisperTranscriber":
+        """
+        Deserializes the component from a dictionary.
+
+        :param data:
+            The dictionary to deserialize from.
+        :returns:
+            The deserialized component.
+        """
+        init_params = data["init_parameters"]
+        if init_params.get("device") is not None:
+            init_params["device"] = ComponentDevice.from_dict(init_params["device"])
+        return default_from_dict(cls, data)
 
     @component.output_types(documents=List[Document])
-    def run(self, audio_files: List[Path], whisper_params: Optional[Dict[str, Any]] = None):
+    def run(self, sources: List[Union[str, Path, ByteStream]], whisper_params: Optional[Dict[str, Any]] = None):
         """
-        Transcribe the audio files into a list of Documents, one for each input file.
+        Transcribes a list of audio files into a list of documents.
 
-        For the supported audio formats, languages, and other parameters, see the
-        [Whisper API documentation](https://platform.openai.com/docs/guides/speech-to-text) and the official Whisper
-        [github repo](https://github.com/openai/whisper).
+        :param sources:
+            A list of paths or binary streams to transcribe.
+        :param whisper_params:
+            For the supported audio formats, languages, and other parameters, see the
+            [Whisper API documentation](https://platform.openai.com/docs/guides/speech-to-text) and the official Whisper
+            [GitHup repo](https://github.com/openai/whisper).
 
-        :param audio_files: A list of paths or binary streams to transcribe.
-        :returns: A list of Documents, one for each file. The content of the document is the transcription text,
-            while the document's metadata contains all the other values returned by the Whisper model, such as the
-            alignment data. Another key called `audio_file` contains the path to the audio file used for the
-            transcription.
+        :returns: A dictionary with the following keys:
+            - `documents`: A list of documents where each document is a transcribed audio file. The content of
+                the document is the transcription text, and the document's metadata contains the values returned by
+                the Whisper model, such as the alignment data and the path to the audio file used
+                for the transcription.
         """
         if self._model is None:
-            raise ComponentError("The component was not warmed up. Run 'warm_up()' before calling 'run()'.")
+            raise RuntimeError(
+                "The component LocalWhisperTranscriber was not warmed up. Run 'warm_up()' before calling 'run()'."
+            )
 
         if whisper_params is None:
             whisper_params = self.whisper_params
 
-        documents = self.transcribe(audio_files, **whisper_params)
+        documents = self.transcribe(sources, **whisper_params)
         return {"documents": documents}
 
-    def transcribe(self, audio_files: Sequence[Union[str, Path, BinaryIO]], **kwargs) -> List[Document]:
+    def transcribe(self, sources: List[Union[str, Path, ByteStream]], **kwargs) -> List[Document]:
         """
-        Transcribe the audio files into a list of Documents, one for each input file.
+        Transcribes the audio files into a list of Documents, one for each input file.
 
         For the supported audio formats, languages, and other parameters, see the
         [Whisper API documentation](https://platform.openai.com/docs/guides/speech-to-text) and the official Whisper
         [github repo](https://github.com/openai/whisper).
 
-        :param audio_files: A list of paths or binary streams to transcribe.
-        :returns: A list of Documents, one for each file. The content of the document is the transcription text,
-            while the document's metadata contains all the other values returned by the Whisper model, such as the
-            alignment data. Another key called `audio_file` contains the path to the audio file used for the
-            transcription.
+        :param sources:
+            A list of paths or binary streams to transcribe.
+        :returns:
+            A list of Documents, one for each file.
         """
-        transcriptions = self._raw_transcribe(audio_files=audio_files, **kwargs)
+        transcriptions = self._raw_transcribe(sources, **kwargs)
         documents = []
-        for audio, transcript in zip(audio_files, transcriptions):
+        for path, transcript in transcriptions.items():
             content = transcript.pop("text")
-            if not isinstance(audio, (str, Path)):
-                audio = "<<binary stream>>"
-            doc = Document(content=content, meta={"audio_file": audio, **transcript})
+            doc = Document(content=content, meta={"audio_file": path, **transcript})
             documents.append(doc)
         return documents
 
-    def _raw_transcribe(self, audio_files: Sequence[Union[str, Path, BinaryIO]], **kwargs) -> List[Dict[str, Any]]:
+    def _raw_transcribe(self, sources: List[Union[str, Path, ByteStream]], **kwargs) -> Dict[Path, Any]:
         """
-        Transcribe the given audio files. Returns the output of the model, a dictionary, for each input file.
+        Transcribes the given audio files. Returns the output of the model, a dictionary, for each input file.
 
         For the supported audio formats, languages, and other parameters, see the
         [Whisper API documentation](https://platform.openai.com/docs/guides/speech-to-text) and the official Whisper
         [github repo](https://github.com/openai/whisper).
 
-        :param audio_files: A list of paths or binary streams to transcribe.
-        :returns: A list of transcriptions.
+        :param sources:
+            A list of paths or binary streams to transcribe.
+        :returns:
+            A dictionary mapping 'file_path' to 'transcription'.
         """
-        return_segments = kwargs.pop("return_segments", False)
-        transcriptions = []
-        for audio_file in audio_files:
-            if isinstance(audio_file, (str, Path)):
-                audio_file = open(audio_file, "rb")
+        if self._model is None:
+            raise RuntimeError("Model is not loaded, please run 'warm_up()' before calling 'run()'")
 
-            # mypy compains that _model is not guaranteed to be not None. It is: check self.warm_up()
-            transcription = self._model.transcribe(audio_file.name, **kwargs)  # type: ignore
+        return_segments = kwargs.pop("return_segments", False)
+        transcriptions = {}
+
+        for source in sources:
+            path = Path(source) if not isinstance(source, ByteStream) else source.meta.get("file_path")
+
+            if isinstance(source, ByteStream) and path is None:
+                with tempfile.NamedTemporaryFile(delete=False) as fp:
+                    path = Path(fp.name)
+                    source.to_file(path)
+
+            transcription = self._model.transcribe(str(path), **kwargs)
+
             if not return_segments:
                 transcription.pop("segments", None)
-            transcriptions.append(transcription)
+
+            transcriptions[path] = transcription
 
         return transcriptions

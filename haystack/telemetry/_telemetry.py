@@ -1,17 +1,24 @@
-from typing import Any, Dict, Optional, TYPE_CHECKING, List, Tuple
-import os
-from pathlib import Path
-from collections import defaultdict
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import datetime
 import logging
+import os
 import uuid
-import yaml
-import posthog
+from collections import defaultdict
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
+import posthog
+import yaml
+
+from haystack import logging as haystack_logging
+from haystack.core.serialization import generate_qualified_class_name
 from haystack.telemetry._environment import collect_system_specs
 
 if TYPE_CHECKING:
-    from haystack.pipeline import Pipeline
+    from haystack.core.pipeline import AsyncPipeline, Pipeline
 
 
 HAYSTACK_TELEMETRY_ENABLED = "HAYSTACK_TELEMETRY_ENABLED"
@@ -21,7 +28,7 @@ CONFIG_PATH = Path("~/.haystack/config.yaml").expanduser()
 MIN_SECONDS_BETWEEN_EVENTS = 60
 
 
-logger = logging.getLogger(__name__)
+logger = haystack_logging.getLogger(__name__)
 
 
 class Telemetry:
@@ -37,8 +44,9 @@ class Telemetry:
 
     def __init__(self):
         """
-        Initializes the telemetry. Loads the user_id from the config file,
-        or creates a new id and saves it if the file is not found.
+        Initializes the telemetry.
+
+        Loads the user_id from the config file, or creates a new id and saves it if the file is not found.
 
         It also collects system information which cannot change across the lifecycle
         of the process (for example `is_containerized()`).
@@ -63,14 +71,17 @@ class Telemetry:
                     if "user_id" in config:
                         self.user_id = config["user_id"]
             except Exception as e:
-                logger.debug("Telemetry could not read the config file %s", CONFIG_PATH, exc_info=e)
+                logger.debug(
+                    "Telemetry could not read the config file {config_path}", config_path=CONFIG_PATH, exc_info=e
+                )
         else:
             # Create the config file
             logger.info(
                 "Haystack sends anonymous usage data to understand the actual usage and steer dev efforts "
                 "towards features that are most meaningful to users. You can opt-out at anytime by manually "
                 "setting the environment variable HAYSTACK_TELEMETRY_ENABLED as described for different "
-                "operating systems in the [documentation page](https://docs.haystack.deepset.ai/docs/telemetry#how-can-i-opt-out). "
+                "operating systems in the "
+                "[documentation page](https://docs.haystack.deepset.ai/docs/telemetry#how-can-i-opt-out). "
                 "More information at [Telemetry](https://docs.haystack.deepset.ai/docs/telemetry)."
             )
             CONFIG_PATH.parents[0].mkdir(parents=True, exist_ok=True)
@@ -79,7 +90,9 @@ class Telemetry:
                 with open(CONFIG_PATH, "w") as outfile:
                     yaml.dump({"user_id": self.user_id}, outfile, default_flow_style=False)
             except Exception as e:
-                logger.debug("Telemetry could not write config file to %s", CONFIG_PATH, exc_info=e)
+                logger.debug(
+                    "Telemetry could not write config file to {config_path}", config_path=CONFIG_PATH, exc_info=e
+                )
 
         self.event_properties = collect_system_specs()
 
@@ -103,6 +116,7 @@ class Telemetry:
 def send_telemetry(func):
     """
     Decorator that sends the output of the wrapped function to PostHog.
+
     The wrapped function is actually called only if telemetry is enabled.
     """
 
@@ -121,8 +135,10 @@ def send_telemetry(func):
 
 
 @send_telemetry
-def pipeline_running(pipeline: "Pipeline") -> Optional[Tuple[str, Dict[str, Any]]]:
+def pipeline_running(pipeline: Union["Pipeline", "AsyncPipeline"]) -> Optional[Tuple[str, Dict[str, Any]]]:
     """
+    Collects telemetry data for a pipeline run and sends it to Posthog.
+
     Collects name, type and the content of the _telemetry_data attribute, if present, for each component in the
     pipeline and sends such data to Posthog.
 
@@ -138,22 +154,23 @@ def pipeline_running(pipeline: "Pipeline") -> Optional[Tuple[str, Dict[str, Any]
     pipeline._last_telemetry_sent = datetime.datetime.now()
 
     # Collect info about components
-    pipeline_description = pipeline.to_dict()
     components: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for component_name, component in pipeline_description["components"].items():
-        instance = pipeline.get_component(component_name)
+    for component_name, instance in pipeline.walk():
+        component_qualified_class_name = generate_qualified_class_name(type(instance))
         if hasattr(instance, "_get_telemetry_data"):
             telemetry_data = getattr(instance, "_get_telemetry_data")()
-            try:
-                components[component["type"]].append({"name": component_name, **telemetry_data})
-            except TypeError:
-                components[component["type"]].append({"name": component_name})
+            if not isinstance(telemetry_data, dict):
+                raise TypeError(
+                    f"Telemetry data for component {component_name} must be a dictionary but is {type(telemetry_data)}."
+                )
+            components[component_qualified_class_name].append({"name": component_name, **telemetry_data})
         else:
-            components[component["type"]].append({"name": component_name})
+            components[component_qualified_class_name].append({"name": component_name})
 
     # Data sent to Posthog
     return "Pipeline run (2.x)", {
         "pipeline_id": str(id(pipeline)),
+        "pipeline_type": generate_qualified_class_name(type(pipeline)),
         "runs": pipeline._telemetry_runs,
         "components": components,
     }
@@ -163,6 +180,7 @@ def pipeline_running(pipeline: "Pipeline") -> Optional[Tuple[str, Dict[str, Any]
 def tutorial_running(tutorial_id: str) -> Tuple[str, Dict[str, Any]]:
     """
     Send a telemetry event for a tutorial, if telemetry is enabled.
+
     :param tutorial_id: identifier of the tutorial
     """
     return "Tutorial", {"tutorial.id": tutorial_id}

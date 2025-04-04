@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
 #
 # SPDX-License-Identifier: Apache-2.0
-from typing import List, Any, Optional
+
+from typing import Any, List, Optional
 
 from haystack.core.component import component
 
@@ -17,7 +18,7 @@ class FString:
         self.variables = variables or []
         if "template" in self.variables:
             raise ValueError("The variable name 'template' is reserved and cannot be used.")
-        component.set_input_types(self, **{variable: Any for variable in self.variables})
+        component.set_input_types(self, **dict.fromkeys(self.variables, Any))
 
     @component.output_types(string=str)
     def run(self, template: Optional[str] = None, **kwargs):

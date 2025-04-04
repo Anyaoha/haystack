@@ -1,8 +1,11 @@
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import random
-import logging
-import numpy as np
 
+from haystack import logging
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +21,6 @@ def set_all_seeds(seed: int, deterministic_cudnn: bool = False) -> None:
     :param deterministic_cudnn: Enable for full reproducibility when using CUDA. Caution: might slow down training.
     """
     random.seed(seed)
-    np.random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
 
     try:
@@ -31,4 +33,4 @@ def set_all_seeds(seed: int, deterministic_cudnn: bool = False) -> None:
             torch.backends.cudnn.benchmark = False
 
     except (ImportError, ModuleNotFoundError) as exc:
-        logger.info("Could not set PyTorch seed because torch is not installed. Exception: %s", exc)
+        logger.info("Could not set PyTorch seed because torch is not installed. Exception: {exception}", exception=exc)

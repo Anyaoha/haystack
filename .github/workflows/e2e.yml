@@ -16,8 +16,10 @@ on:
       - ".github/workflows/e2e.yml"
 
 env:
-  PYTHON_VERSION: "3.8"
+  PYTHON_VERSION: "3.9"
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  HATCH_VERSION: "1.13.0"
+  HF_API_TOKEN: ${{ secrets.HUGGINGFACE_API_KEY }}
 
 jobs:
   run:
@@ -28,15 +30,30 @@ jobs:
 
     - uses: actions/setup-python@v5
       with:
-        python-version: ${{ env.PYTHON_VERSION }}
+        python-version: "${{ env.PYTHON_VERSION }}"
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt install ffmpeg  # for local Whisper tests
-
-    - name: Install Haystack
-      run: pip install .[dev,audio] langdetect transformers[torch,sentencepiece]==4.35.2 'sentence-transformers>=2.2.0' pypdf tika 'azure-ai-formrecognizer>=3.2.0b2'
+    - name: Install Hatch
+      run: pip install hatch==${{ env.HATCH_VERSION }}
 
     - name: Run tests
-      run: pytest e2e
+      run: hatch run test:e2e
+
+    - name: Send event to Datadog
+      if: failure() && github.event_name == 'schedule'
+      uses: masci/datadog@v1
+      with:
+        api-key: ${{ secrets.CORE_DATADOG_API_KEY }}
+        api-url: https://api.datadoghq.eu
+        events: |
+          - title: "${{ github.workflow }} workflow"
+            text: "Job ${{ github.job }} in branch ${{ github.ref_name }}"
+            alert_type: "error"
+            source_type_name: "Github"
+            host: ${{ github.repository_owner }}
+            tags:
+              - "project:${{ github.repository }}"
+              - "job:${{ github.job }}"
+              - "run_id:${{ github.run_id }}"
+              - "workflow:${{ github.workflow }}"
+              - "branch:${{ github.ref_name }}"
+              - "url:https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"

@@ -1,15 +1,24 @@
-from typing import Optional, Type
-from types import TracebackType
-from lazy_imports.try_import import _DeferredImportExceptionContextManager
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
 
+from types import TracebackType
+from typing import Optional, Type
+
+from lazy_imports.try_import import _DeferredImportExceptionContextManager
 
 DEFAULT_IMPORT_ERROR_MSG = "Try 'pip install {}'"
 
 
 class LazyImport(_DeferredImportExceptionContextManager):
     """
-    Wrapper on top of lazy_import's _DeferredImportExceptionContextManager that adds the possibility to customize the
-    error messages.
+    A context manager that provides controlled handling of import errors.
+
+    It adds the possibility to customize the error messages.
+
+    NOTE: Despite its name, this class does not delay the actual import operation.
+    For installed modules: executes the import immediately.
+    For uninstalled modules: captures the error and defers it until check() is called.
     """
 
     def __init__(self, message: str = DEFAULT_IMPORT_ERROR_MSG) -> None:
@@ -19,7 +28,8 @@ class LazyImport(_DeferredImportExceptionContextManager):
     def __exit__(
         self, exc_type: Optional[Type[Exception]], exc_value: Optional[Exception], traceback: Optional[TracebackType]
     ) -> Optional[bool]:
-        """Exit the context manager.
+        """
+        Exit the context manager.
 
         Args:
             exc_type:

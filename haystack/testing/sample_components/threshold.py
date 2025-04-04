@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
 #
 # SPDX-License-Identifier: Apache-2.0
+
 from typing import Optional
 
 from haystack.core.component import component
@@ -9,8 +10,7 @@ from haystack.core.component import component
 @component
 class Threshold:  # pylint: disable=too-few-public-methods
     """
-    Redirects the value, unchanged, along a different connection whether the value is above
-    or below the given threshold.
+    Redirects the value, along a different connection whether the value is above or below the given threshold.
 
     :param threshold: the number to compare the input value against. This is also a parameter.
     """
@@ -24,8 +24,7 @@ class Threshold:  # pylint: disable=too-few-public-methods
     @component.output_types(above=int, below=int)
     def run(self, value: int, threshold: Optional[int] = None):
         """
-        Redirects the value, unchanged, along a different connection whether the value is above
-        or below the given threshold.
+        Redirects the value, along a different connection whether the value is above or below the given threshold.
 
         :param threshold: the number to compare the input value against. This is also a parameter.
         """
